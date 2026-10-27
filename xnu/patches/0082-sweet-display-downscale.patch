@@ -1,0 +1,279 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -104,6 +104,9 @@ public:
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	uint32_t      fScale;           /* presented -> panel 16.16, 0 = crop 1:1 */
++	uint32_t      fCanvasW, fCanvasH;       /* scaled canvas, panel pixels */
++	int32_t       fPanelX, fPanelY;         /* panel offset of the canvas */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -176,6 +179,26 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	/*
++	 * A panel much smaller than the presented canvas (UMS9230: 720x1612
++	 * for 1125x2436) cannot show the centered crop without cutting off
++	 * most of the screen, so scale the whole canvas down uniformly and
++	 * letterbox it instead. Panels within 10% of the canvas (sweet:
++	 * 1080x2400) keep the 1:1 centered crop.
++	 */
++	fCanvasW = fWidth;
++	fCanvasH = fHeight;
++	if ((uint64_t)fWidth * 100 < (uint64_t)fLogicalW * 90 ||
++	    (uint64_t)fHeight * 100 < (uint64_t)fLogicalH * 90) {
++		uint64_t sw = ((uint64_t)fWidth << 16) / fLogicalW;
++		uint64_t sh = ((uint64_t)fHeight << 16) / fLogicalH;
++
++		fScale = (uint32_t)(sw < sh ? sw : sh);
++		fCanvasW = (uint32_t)(((uint64_t)fLogicalW * fScale + 0x8000) >> 16);
++		fCanvasH = (uint32_t)(((uint64_t)fLogicalH * fScale + 0x8000) >> 16);
++		fPanelX = ((int32_t)fWidth - (int32_t)fCanvasW) / 2;
++		fPanelY = ((int32_t)fHeight - (int32_t)fCanvasH) / 2;
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -192,6 +215,24 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
++	if (fScale != 0) {
++		/* Black out the letterbox bars (they hold the boot splash). */
++		for (uint32_t y = 0; y < fHeight; y++) {
++			uint8_t *row = (uint8_t *)(fPixels + (uint64_t)y * fRowBytes);
++
++			if (y < (uint32_t)fPanelY || y >= (uint32_t)(fPanelY + (int32_t)fCanvasH)) {
++				memset(row, 0, fRowBytes);
++				continue;
++			}
++			if (fPanelX > 0) {
++				memset(row, 0, (size_t)fPanelX * 4);
++			}
++			if (fPanelX + (int32_t)fCanvasW < (int32_t)fWidth) {
++				memset(row + (fPanelX + (int32_t)fCanvasW) * 4, 0,
++				    (size_t)((int32_t)fWidth - fPanelX - (int32_t)fCanvasW) * 4);
++			}
++		}
++	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+@@ -203,6 +244,10 @@ AppleCLCD::start(IOService *provider)
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	if (fScale != 0) {
++		IOLog("SWEET FB: canvas scaled to %ux%u at %d,%d (16.16 scale %u)\n",
++		    fCanvasW, fCanvasH, fPanelX, fPanelY, fScale);
++	}
+ 	return true;
+ }
+ 
+@@ -359,18 +404,20 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
+-		/* Logical (presented) display coordinates -> panel coordinates. */
+-		dx -= fOffX;
+-		dy -= fOffY;
+-		if (dx < 0) {
+-			sx -= dx;
+-			w += dx;
+-			dx = 0;
+-		}
+-		if (dy < 0) {
+-			sy -= dy;
+-			h += dy;
+-			dy = 0;
++		if (fScale == 0) {
++			/* Logical (presented) display coordinates -> panel coordinates. */
++			dx -= fOffX;
++			dy -= fOffY;
++			if (dx < 0) {
++				sx -= dx;
++				w += dx;
++				dx = 0;
++			}
++			if (dy < 0) {
++				sy -= dy;
++				h += dy;
++				dy = 0;
++			}
+ 		}
+ 		if (w > (int32_t)s->width - sx) {
+ 			w = (int32_t)s->width - sx;
+@@ -378,11 +425,20 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (h > (int32_t)s->height - sy) {
+ 			h = (int32_t)s->height - sy;
+ 		}
+-		if (w > (int32_t)fWidth - dx) {
+-			w = (int32_t)fWidth - dx;
+-		}
+-		if (h > (int32_t)fHeight - dy) {
+-			h = (int32_t)fHeight - dy;
++		if (fScale == 0) {
++			if (w > (int32_t)fWidth - dx) {
++				w = (int32_t)fWidth - dx;
++			}
++			if (h > (int32_t)fHeight - dy) {
++				h = (int32_t)fHeight - dy;
++			}
++		} else {
++			if (w > (int32_t)fLogicalW - dx) {
++				w = (int32_t)fLogicalW - dx;
++			}
++			if (h > (int32_t)fLogicalH - dy) {
++				h = (int32_t)fLogicalH - dy;
++			}
+ 		}
+ 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+@@ -391,10 +447,50 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
+-			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++			if (fScale == 0) {
++				for (int32_t y = 0; y < h; y++) {
++					memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++					    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++					    (size_t)w * 4);
++				}
++			} else {
++				/* The presented canvas is larger than the panel:
++				 * uniform nearest-neighbour downscale. */
++				int32_t x0 = fPanelX + (int32_t)(((uint64_t)dx * fScale) >> 16);
++				int32_t y0 = fPanelY + (int32_t)(((uint64_t)dy * fScale) >> 16);
++				int32_t x1 = fPanelX + (int32_t)(((uint64_t)(dx + w) * fScale + 0x8000) >> 16);
++				int32_t y1 = fPanelY + (int32_t)(((uint64_t)(dy + h) * fScale + 0x8000) >> 16);
++				int32_t pw, ph;
++
++				if (x0 < 0) {
++					x0 = 0;
++				}
++				if (y0 < 0) {
++					y0 = 0;
++				}
++				if (x1 > (int32_t)fWidth) {
++					x1 = (int32_t)fWidth;
++				}
++				if (y1 > (int32_t)fHeight) {
++					y1 = (int32_t)fHeight;
++				}
++				pw = x1 - x0;
++				ph = y1 - y0;
++				if (pw > 0 && ph > 0) {
++					uint32_t step = (uint32_t)(((uint64_t)w << 16) / (uint32_t)pw);
++
++					for (int32_t y = 0; y < ph; y++) {
++						const uint8_t *srow = (const uint8_t *)src + s->offset +
++						    (uint64_t)(sy + (int32_t)(((uint64_t)y * h) / (uint32_t)ph)) * s->bytesPerRow;
++						uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)(y0 + y) * fRowBytes) + x0;
++						uint32_t acc = step / 2;
++
++						for (int32_t x = 0; x < pw; x++) {
++							drow[x] = *(const uint32_t *)(srow + (uint64_t)(sx + (int32_t)(acc >> 16)) * 4);
++							acc += step;
++						}
++					}
++				}
+ 			}
+ 		}
+ 		s->release();
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -368,6 +368,9 @@ protected:
+ private:
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
++	int fPanelW, fPanelH;               /* physical panel pixels */
++	uint32_t fScale;                    /* panel -> canvas 16.16, 0 = offset */
++	uint32_t fCanvasW, fCanvasH;        /* presented canvas, panel pixels */
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+@@ -433,11 +436,32 @@ SweetHIDTouch::start(IOService *provider)
+ 		return false;
+ 	}
+ 	int native = 0;
++	PE_Video video;
++
++	PE_current_console(&video);
++	fPanelW = video.v_width > 0 ? (int)video.v_width : 1080;
++	fPanelH = video.v_height > 0 ? (int)video.v_height : 2400;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	fLogicalW = native ? fPanelW : 1125;
++	fLogicalH = native ? fPanelH : 2436;
++	fCanvasW = (uint32_t)fPanelW;
++	fCanvasH = (uint32_t)fPanelH;
++	/* Same rule as SweetFramebuffer.cpp: scale only for much smaller panels. */
++	if ((uint64_t)fPanelW * 100 < (uint64_t)fLogicalW * 90 ||
++	    (uint64_t)fPanelH * 100 < (uint64_t)fLogicalH * 90) {
++		/* SweetFramebuffer.cpp scales the presented canvas down to fit. */
++		uint64_t sw = ((uint64_t)fPanelW << 16) / fLogicalW;
++		uint64_t sh = ((uint64_t)fPanelH << 16) / fLogicalH;
++
++		fScale = (uint32_t)(sw < sh ? sw : sh);
++		fCanvasW = (uint32_t)(((uint64_t)fLogicalW * fScale + 0x8000) >> 16);
++		fCanvasH = (uint32_t)(((uint64_t)fLogicalH * fScale + 0x8000) >> 16);
++		fOffX = (fPanelW - (int32_t)fCanvasW) / 2;
++		fOffY = (fPanelH - (int32_t)fCanvasH) / 2;
++	} else {
++		fOffX = (fLogicalW - fPanelW) / 2;
++		fOffY = (fLogicalH - fPanelH) / 2;
++	}
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -458,22 +482,33 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	x = x < 0 ? 0 : (x > fPanelW - 1 ? fPanelW - 1 : x);
++	y = y < 0 ? 0 : (y > fPanelH - 1 ? fPanelH - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+-	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	/* Panel pixels -> the presented 1125x2436 canvas (SweetFramebuffer.cpp). */
++	IOFixed nx, ny;
++	if (fScale != 0) {
++		int32_t cx = x - fOffX, cy = y - fOffY;
++
++		cx = cx < 0 ? 0 : (cx > (int32_t)fCanvasW - 1 ? (int32_t)fCanvasW - 1 : cx);
++		cy = cy < 0 ? 0 : (cy > (int32_t)fCanvasH - 1 ? (int32_t)fCanvasH - 1 : cy);
++		nx = (IOFixed)(((int64_t)cx << 16) / fCanvasW);
++		ny = (IOFixed)(((int64_t)cy << 16) / fCanvasH);
++	} else {
++		nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
++		ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	}
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		int32_t ef = (int32_t)(((int64_t)SWEET_TOUCH_EDGE_PX << 16) / fPanelW);
++
++		fEdge[finger] = nx < ef || nx > 0x10000 - ef || ny < ef || ny > 0x10000 - ef;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
