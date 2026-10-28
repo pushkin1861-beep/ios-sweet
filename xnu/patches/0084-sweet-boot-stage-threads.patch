@@ -1,7 +1,7 @@
 diff --git a/bsd/dev/sweet_boot.c b/bsd/dev/sweet_boot.c
 --- a/bsd/dev/sweet_boot.c
 +++ b/bsd/dev/sweet_boot.c
-@@ -1,51 +1,169 @@
+@@ -1,51 +1,179 @@
  /*
   * SWEET boot progress trace.
   *
@@ -32,7 +32,6 @@ diff --git a/bsd/dev/sweet_boot.c b/bsd/dev/sweet_boot.c
  #include <kern/clock.h>
  #include <libkern/libkern.h>
  #include <pexpert/pexpert.h>
-+#include <IOKit/IOLib.h>
 +#include <string.h>
  
 -extern void sweet_fbcon_alive(unsigned int beat, int stage);
@@ -51,8 +50,6 @@ diff --git a/bsd/dev/sweet_boot.c b/bsd/dev/sweet_boot.c
 +static thread_t sweet_main_thread;                  /* referenced, never dropped */
 +#define SWEET_SIDE_THREADS  4
 +static thread_t sweet_side_threads[SWEET_SIDE_THREADS];
-+static int sweet_side_count;
-+static IOLock *sweet_side_lock;
 +
 +static uint64_t
 +sweet_uptime_ms(void)
@@ -85,31 +82,27 @@ diff --git a/bsd/dev/sweet_boot.c b/bsd/dev/sweet_boot.c
 +/*
 + * Keep a reference on each IOKit config thread that marks, so the heartbeat can
 + * still read the block state of one that is parked inside a driver's start().
-+ * A lost race here only leaks a reference; a thread is never stored unowned.
++ * No lock: this runs while holding the IOKit arbitration lock, and a slot is
++ * published with one atomic swap. A lost race costs an extra reference on a
++ * still-running thread (released again right away), never a dangling pointer.
 + */
 +static void
 +sweet_side_track(thread_t self)
 +{
 +	int i;
 +
-+	if (sweet_side_lock == NULL) {
-+		sweet_side_lock = IOLockAlloc();
-+		if (sweet_side_lock == NULL) {
++	for (i = 0; i < SWEET_SIDE_THREADS; i++) {
++		if (sweet_side_threads[i] == self) {
++			return;
++		}
++		if (sweet_side_threads[i] == NULL) {
++			thread_reference(self);
++			if (!__sync_bool_compare_and_swap(&sweet_side_threads[i], NULL, self)) {
++				thread_deallocate(self);
++			}
 +			return;
 +		}
 +	}
-+
-+	IOLockLock(sweet_side_lock);
-+	for (i = 0; i < sweet_side_count; i++) {
-+		if (sweet_side_threads[i] == self) {
-+			break;
-+		}
-+	}
-+	if ((i == sweet_side_count) && (sweet_side_count < SWEET_SIDE_THREADS)) {
-+		thread_reference(self);
-+		sweet_side_threads[sweet_side_count++] = self;
-+	}
-+	IOLockUnlock(sweet_side_lock);
 +}
 +
 +void
@@ -142,6 +135,20 @@ diff --git a/bsd/dev/sweet_boot.c b/bsd/dev/sweet_boot.c
 +		    (unsigned long long) event, (unsigned int) state,
 +		    (unsigned long) kstack);
 +	}
++}
++
++static thread_t
++sweet_side_last(void)
++{
++	thread_t found = THREAD_NULL;
++	int i;
++
++	for (i = 0; i < SWEET_SIDE_THREADS; i++) {
++		if (sweet_side_threads[i] != NULL) {
++			found = sweet_side_threads[i];
++		}
++	}
++	return found;
  }
  
  static void
@@ -182,15 +189,18 @@ diff --git a/bsd/dev/sweet_boot.c b/bsd/dev/sweet_boot.c
 +		    sweet_beat - sweet_main_beat, sweet_boot_stage,
 +		    sweet_boot_label, jobs, threads, waiting);
 +		sweet_print_block("main", sweet_main_thread);
-+		if (sweet_side_count > 0) {
-+			sweet_print_block("side",
-+			    sweet_side_threads[sweet_side_count - 1]);
++		{
++			thread_t side = sweet_side_last();
++
++			if (side != THREAD_NULL) {
++				sweet_print_block("side", side);
++			}
 +		}
 +		printf("\n");
  	}
  }
  
-@@ -63,4 +181,5 @@
+@@ -63,4 +191,5 @@
  		thread_deallocate(thread);
  	}
  }
