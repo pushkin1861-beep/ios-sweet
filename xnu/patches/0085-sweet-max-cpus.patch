@@ -1,0 +1,33 @@
+diff -ruN a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+--- a/iokit/Kernel/IOStartIOKit.cpp	2026-10-28 14:10:26.232500384 +0300
++++ b/iokit/Kernel/IOStartIOKit.cpp	2026-10-28 14:11:10.006976549 +0300
+@@ -85,7 +85,7 @@
+ 	sweet_boot_mark(46, "waiting for IORTC resource");
+ #endif
+ // RTC is not present on this target
+-#ifndef BCM2837
++#if !defined(BCM2837) && !defined(ARM64_BOARD_CONFIG_SWEET)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
+ #endif
+diff -ruN a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+--- a/osfmk/kern/startup.c	2026-10-28 14:10:26.232500384 +0300
++++ b/osfmk/kern/startup.c	2026-10-28 14:10:50.284425601 +0300
+@@ -780,6 +780,17 @@
+ #endif
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_boot_mark(3, "IOKit matching returned");
++	/*
++	 * On Apple silicon this is done by AppleARMPE: its interrupt-controller
++	 * and CPU-nub drivers reach IOCPUInterruptController or AppleARMSMP
++	 * before the lockdown ends. SWEET has neither yet -- the ADT's
++	 * arm,gic-v3 has no driver and no CPU nub publishes through SweetCPU --
++	 * so nobody sets the flag and kperf_init_early() parks forever in
++	 * ml_wait_max_cpus(). machine_info.max_cpus was already computed from
++	 * the real topology by machine_conf(), and the arm setter ignores its
++	 * argument; this is the last legal moment to settle it.
++	 */
++	ml_set_max_cpus(machine_info.max_cpus);
+ #endif
+ 	/*
+ 	 * max_cpus must be nailed down by the time PE_lockdown_iokit() finishes,
