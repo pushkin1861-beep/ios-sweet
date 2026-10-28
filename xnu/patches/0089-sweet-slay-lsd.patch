@@ -1,0 +1,110 @@
+diff -ruN a/bsd/dev/sweet_boot.c b/bsd/dev/sweet_boot.c
+--- a/bsd/dev/sweet_boot.c	2026-10-28 17:55:00.117671232 +0300
++++ b/bsd/dev/sweet_boot.c	2026-10-28 22:58:15.782745482 +0300
+@@ -14,6 +14,9 @@
+ 
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <sys/signal.h>
+ #include <kern/thread.h>
+ #include <kern/clock.h>
+ #include <libkern/libkern.h>
+@@ -115,6 +118,77 @@
+ 	return (hi << 16) | lo;
+ }
+ 
++/*
++ * Bring-up hack: lsd can wedge in LaunchServices database seeding (journal
++ * recovery waits a dispatch group that needs a reply delivered on the same
++ * serial queue). Deterministic deadlock, seen on device: SpringBoard's
++ * LSCopyServerStore never returns (samples: ___LAUNCH_SERVICES_CLIENTS_ARE_COMM
++ * WAITING_FOR_THE_DATABASE_TO_FINISH_SEEDING__ + MIInstallationIdentity ulock
++ * waits). boot-arg sweetslay=<secs>[,<secs>...] kills the "lsd" process at
++ * those uptimes so launchd spawns a fresh one; the MobileGestalt helper is
++ * already running by then and the retry usually seeds cleanly.
++ */
++extern int hz;
++extern void psignal(proc_t, int);
++
++static int sweet_slay_killed;
++
++static int
++sweet_slay_cb(proc_t q, __unused void *arg)
++{
++	char name[32];
++	proc_name(proc_pid(q), name, sizeof(name));
++	if (strcmp(name, "lsd") == 0) {
++		psignal(q, SIGKILL);
++		sweet_slay_killed++;
++	}
++	return PROC_RETURNED;
++}
++
++static void
++sweet_slay_kill_lsd(void)
++{
++	sweet_slay_killed = 0;
++	proc_iterate(PROC_ALLPROCLIST, sweet_slay_cb, NULL, NULL, NULL);
++	printf("SWEET SLAY: killed %d lsd process(es)\n", sweet_slay_killed);
++}
++
++static void
++sweet_slay_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++	char argbuf[64];
++	if (!PE_parse_boot_argn("sweetslay", argbuf, sizeof(argbuf))) {
++		return;
++	}
++	const char *t = argbuf;
++	while (*t) {
++		int secs = 0;
++		while (*t >= '0' && *t <= '9') {
++			secs = secs * 10 + (*t - '0');
++			t++;
++		}
++		if (secs <= 0 || secs > 600) {
++			break;
++		}
++		(void)tsleep(&chan, PZERO, "sweetslay", hz * secs);
++		sweet_slay_kill_lsd();
++		if (*t != ',') {
++			break;
++		}
++		t++;
++	}
++}
++
++void
++sweet_slay_start(void)
++{
++	thread_t thread;
++	if (kernel_thread_start(sweet_slay_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ void
+ sweet_wdt_disarm(void)
+ {
+diff -ruN a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c	2026-10-28 17:55:31.469411668 +0300
++++ b/bsd/kern/bsd_init.c	2026-10-28 22:56:59.859614761 +0300
+@@ -264,6 +264,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern void sweet_boot_mark(int stage, const char *label);     /* bsd/dev/sweet_boot.c */
+ extern void sweet_wdt_disarm(void);                            /* bsd/dev/sweet_boot.c */
++extern void sweet_slay_start(void);                            /* bsd/dev/sweet_boot.c */
+ #define SWEET_MARK(n, s)        sweet_boot_mark(n, s)
+ #else
+ #define SWEET_MARK(n, s)
+@@ -496,6 +497,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_boot_mark(10, "bsd_init enter");
+ 	sweet_wdt_disarm(); /* sprd AP watchdog: LK arms it, Android feeds it, we're on our own (bsd/dev/sweet_boot.c) */
++	sweet_slay_start(); /* boot-arg sweetslay=<secs,...>: kill a wedged daemon (bring-up) */
+ #endif
+ 
+ #if (DEVELOPMENT || DEBUG)
