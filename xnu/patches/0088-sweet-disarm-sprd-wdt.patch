@@ -1,0 +1,158 @@
+diff -ruN a/bsd/dev/sweet_boot.c b/bsd/dev/sweet_boot.c
+--- a/bsd/dev/sweet_boot.c	2026-10-28 14:10:26.232500384 +0300
++++ b/bsd/dev/sweet_boot.c	2026-10-28 17:55:00.117671232 +0300
+@@ -20,6 +20,8 @@
+ #include <pexpert/pexpert.h>
+ #include <string.h>
+ 
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
+ extern void sweet_fbcon_alive(unsigned int beat, int stage);   /* pexpert/arm/pe_serial.c */
+ void sweet_iokit_stats(int *jobs, int *threads, int *waiting); /* iokit/Kernel/IOService.cpp */
+ int sweet_thread_block_info(thread_t thread, uint64_t *event, uintptr_t *kstack,
+@@ -63,6 +65,87 @@
+ }
+ 
+ /*
++ * Spreadtrum AP watchdog (DT node watchdog@644e0000, "sprd,wdt-r2p0-fiq").
++ * LK arms it (uboot_a strings: "AP_WATCHDOG_REBOOT", "setwatchdog",
++ * "wdgreboot"); Android feeds it, but nothing in this kernel does, so on
++ * a slow bring-up boot the SoC hard-resets after LK's timeout and the
++ * phone loops. Registers per drivers/watchdog/sprd_wdt.c (r2p0 family):
++ *   0x00 LOAD_LOW   0x04 LOAD_HIGH  0x08 CTRL      0x0c INT_CLR
++ *   0x10 INT_RAW    0x14 INT_MSK    0x18 CNT_LOW   0x1c CNT_HIGH
++ *   0x20 LOCK       0x2c/0x30 IRQ_LOAD
++ * CTRL: bit0 INT_EN, bit1 CNT_EN, bit2 NEW_VER_EN, bit3 RST_EN.
++ * Unlock with 0xE551 written to LOCK, 0 re-locks. 1-s tick = 32768.
++ * Disarm once at bsd_init start; `sweetwdt=2` leaves it alone.
++ */
++#define SWEET_WDT_PA        0x644e0000u
++#define SWEET_WDT_SIZE      0x1000u
++#define SWEET_WDT_CTRL      0x08u
++#define SWEET_WDT_INT_CLR   0x0cu
++#define SWEET_WDT_INT_RAW   0x10u
++#define SWEET_WDT_CNT_LOW   0x18u
++#define SWEET_WDT_CNT_HIGH  0x1cu
++#define SWEET_WDT_LOCK      0x20u
++#define SWEET_WDT_UNLOCK    0xe551u
++#define SWEET_WDT_INT_EN    (1u << 0)
++#define SWEET_WDT_CNT_EN    (1u << 1)
++#define SWEET_WDT_RST_EN    (1u << 3)
++#define SWEET_WDT_INT_CLEAR (1u << 0)
++#define SWEET_WDT_RST_CLEAR (1u << 3)
++
++static inline void
++sweet_wdt_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile("dmb osh" ::: "memory");
++}
++
++static inline uint32_t
++sweet_wdt_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static uint64_t
++sweet_wdt_count(vm_offset_t base)
++{
++	uint64_t hi = sweet_wdt_rd(base, SWEET_WDT_CNT_HIGH);
++	uint64_t lo = sweet_wdt_rd(base, SWEET_WDT_CNT_LOW) & 0xffffu;
++	return (hi << 16) | lo;
++}
++
++void
++sweet_wdt_disarm(void)
++{
++	uint32_t keep = 0;
++	(void)PE_parse_boot_argn("sweetwdt", &keep, sizeof(keep));
++	if (keep == 2u) {
++		printf("SWEET WDT: sweetwdt=2, leaving sprd-wdt as-is\n");
++		return;
++	}
++	vm_offset_t base = ml_io_map(SWEET_WDT_PA, SWEET_WDT_SIZE);
++	if (base == 0) {
++		printf("SWEET WDT: ml_io_map failed\n");
++		return;
++	}
++	uint32_t ctrl_before = sweet_wdt_rd(base, SWEET_WDT_CTRL);
++	uint32_t raw_before = sweet_wdt_rd(base, SWEET_WDT_INT_RAW);
++	uint64_t cnt_a = sweet_wdt_count(base);
++	sweet_wdt_wr(base, SWEET_WDT_LOCK, SWEET_WDT_UNLOCK);
++	sweet_wdt_wr(base, SWEET_WDT_CTRL,
++	    ctrl_before & ~(SWEET_WDT_INT_EN | SWEET_WDT_CNT_EN | SWEET_WDT_RST_EN));
++	sweet_wdt_wr(base, SWEET_WDT_INT_CLR, SWEET_WDT_INT_CLEAR | SWEET_WDT_RST_CLEAR);
++	sweet_wdt_wr(base, SWEET_WDT_LOCK, 0);
++	delay(200000); /* ~6 ticks of the 32.768 kHz counter */
++	uint32_t ctrl_after = sweet_wdt_rd(base, SWEET_WDT_CTRL);
++	uint64_t cnt_b = sweet_wdt_count(base);
++	printf("SWEET WDT: sprd-wdt disarmed: ctrl %#x -> %#x, int_raw %#x, cnt %llu -> %llu (%s)\n",
++	    ctrl_before, ctrl_after, raw_before, cnt_a, cnt_b,
++	    cnt_a == cnt_b ? "counter frozen" : "COUNTER STILL RUNNING");
++}
++
++/*
+  * Keep a reference on each IOKit config thread that marks, so the heartbeat can
+  * still read the block state of one that is parked inside a driver's start().
+  * No lock: this runs while holding the IOKit arbitration lock, and a slot is
+diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c	2026-10-28 14:10:26.226499898 +0300
++++ b/bsd/dev/sweet_ufs.c	2026-10-28 15:37:09.030802543 +0300
+@@ -663,10 +663,31 @@
+ 	sweet_boot_mark(45, "ufs init: devfs nodes ready");
+ 	sweet_log_start();
+ 	sweet_sample_start();
+-	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+-	sweet_keys_init();
+-	sweet_touch_init();
+-	sweet_usb_probe();
++	/*
++	 * The keys/touch/USB probes are written for the original ios-sweet board
++	 * (Qualcomm SDM730): sweet_keys reads the SPMI arbiter at 0x0c440000,
++	 * sweet_touch the GENI SE at 0x00a84000 plus QCOM GCC at 0x00100000,
++	 * sweet_usb the same GCC and a Qualcomm DWC3/QUSB2. This board is a
++	 * Unisoc T606: those physical ranges decode to nothing, and the first
++	 * readl takes a synchronous external abort. Seen on device (603.jpg):
++	 * panic(cpu 0): Kernel data abort at _sweet_keys_init+0xac --
++	 * keys_rd(keys_core, 0) -- ESR 0x96000010 (sync external abort, read,
++	 * not a translation fault; the ml_io_map mapping itself was valid),
++	 * far = the freshly mapped VA of PA 0x0c440000.
++	 * The touch thread would hit the same abort ~45 s later, mid-userspace,
++	 * so all Qualcomm probes are off by default here; sweetprobes=1 brings
++	 * them back when this board gets its own input/USB drivers.
++	 */
++	uint32_t probes = 0;
++	(void)PE_parse_boot_argn("sweetprobes", &probes, sizeof(probes));
++	if (probes) {
++		/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
++		sweet_keys_init();
++		sweet_touch_init();
++		sweet_usb_probe();
++	} else {
++		printf("SWEET: skipping Qualcomm input/USB probes (sweetprobes=0), Unisoc drivers TBD\n");
++	}
+ 	return 0;
+ }
+ 
+diff -ruN a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c	2026-10-28 15:10:52.422823802 +0300
++++ b/bsd/kern/bsd_init.c	2026-10-28 17:55:31.469411668 +0300
+@@ -263,6 +263,7 @@
+ extern kern_return_t IOFindBSDRoot(char *, unsigned int, dev_t *, u_int32_t *);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern void sweet_boot_mark(int stage, const char *label);     /* bsd/dev/sweet_boot.c */
++extern void sweet_wdt_disarm(void);                            /* bsd/dev/sweet_boot.c */
+ #define SWEET_MARK(n, s)        sweet_boot_mark(n, s)
+ #else
+ #define SWEET_MARK(n, s)
+@@ -494,6 +495,7 @@
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_boot_mark(10, "bsd_init enter");
++	sweet_wdt_disarm(); /* sprd AP watchdog: LK arms it, Android feeds it, we're on our own (bsd/dev/sweet_boot.c) */
+ #endif
+ 
+ #if (DEVELOPMENT || DEBUG)
