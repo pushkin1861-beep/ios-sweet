@@ -1,0 +1,56 @@
+diff -ruN a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c	2026-10-28 14:10:26.232500384 +0300
++++ b/bsd/kern/bsd_init.c	2026-10-28 15:10:52.422823802 +0300
+@@ -1039,6 +1039,8 @@
+ 
+ #endif /* CONFIG_IMAGEBOOT */
+ 
++	SWEET_MARK(17, "post-root auth/imageboot checks done");
++
+ 	/* set initial time; all other resource data is  already zero'ed */
+ 	microtime_with_abstime(&kernproc->p_start, &kernproc->p_stats->ps_start);
+ 
+@@ -1051,6 +1053,8 @@
+ 	}
+ #endif /* DEVFS */
+ 
++	SWEET_MARK(18, "devfs mounted on /dev");
++
+ #if CONFIG_BASESYSTEMROOT
+ #if CONFIG_IMAGEBOOT
+ 	if (bsdmgroot_bootable()) {
+@@ -1088,6 +1092,8 @@
+ #endif /* CONFIG_IMAGEBOOT */
+ #endif /* CONFIG_BASESYSTEMROOT */
+ 
++	SWEET_MARK(19, "basesystem-dmg check done");
++
+ 	/* Initialize signal state for process 0. */
+ 	bsd_init_kprintf("calling siginit\n");
+ 	siginit(kernproc);
+@@ -1118,6 +1124,7 @@
+ 	machine_timeout_bsd_init();
+ #endif /* DEVELOPMENT || DEBUG */
+ 
++	SWEET_MARK(90, "bsd_init done");
+ 	bsd_init_kprintf("done\n");
+ }
+ 
+@@ -1135,7 +1142,9 @@
+ 	mac_cred_label_associate_user(proc_ucred(p));
+ #endif
+ 
++	SWEET_MARK(91, "init task: ux_handler ready");
+ 	vm_init_before_launchd();
++	SWEET_MARK(92, "init task: vm_init_before_launchd done");
+ 
+ #if CONFIG_XNUPOST
+ 	int result = bsd_list_tests();
+@@ -1147,6 +1156,7 @@
+ 
+ 	bsd_init_kprintf("bsd_do_post - done");
+ 
++	SWEET_MARK(93, "init task: loading launchd");
+ 	load_init_program(p);
+ 	lock_trace = 1;
+ }
