@@ -1,0 +1,674 @@
+diff --git a/bsd/dev/sweet_boot.c b/bsd/dev/sweet_boot.c
+--- a/bsd/dev/sweet_boot.c
++++ b/bsd/dev/sweet_boot.c
+@@ -1,51 +1,169 @@
+ /*
+  * SWEET boot progress trace.
+  *
+- * During bring-up the console can stop at any point and a photograph of a
+- * frozen screen cannot tell a dead kernel from one that is alive with its
+- * console output stuck. This adds two independent signs of life:
+- *
+- *  - sweet_boot_mark() prints (and remembers) the last boot milestone, so a
+- *    heartbeat names the place the boot stopped at;
+- *  - a kernel thread prints "SWEET ALIVE <beat> ..." every two seconds and
+- *    paints a growing bar straight into the panel through the framebuffer
+- *    console's mapping (pexpert/arm/pe_serial.c), bypassing the console
+- *    ring, so the screen keeps changing even if console output dies.
++ * Filming a frozen screen cannot tell a dead kernel from one whose console
++ * output stopped, and one "last stage" is not enough here: driver starts run
++ * on IOKit config threads while the bootstrap thread is already in BSD init,
++ * so the two progress channels are kept apart and every mark is timed. The
++ * heartbeat then reports where each thread stands, how long the bootstrap has
++ * not moved and what the IOKit matching queue is doing.
+  *
+  * Boot-arg sweetheartbeat=0 disables the heartbeat thread.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/thread.h>
+ #include <kern/clock.h>
+ #include <libkern/libkern.h>
+ #include <pexpert/pexpert.h>
++#include <IOKit/IOLib.h>
++#include <string.h>
+ 
+-extern void sweet_fbcon_alive(unsigned int beat, int stage);
++extern void sweet_fbcon_alive(unsigned int beat, int stage);   /* pexpert/arm/pe_serial.c */
++void sweet_iokit_stats(int *jobs, int *threads, int *waiting); /* iokit/Kernel/IOService.cpp */
++int sweet_thread_block_info(thread_t thread, uint64_t *event, uintptr_t *kstack,
++    int *state);                                               /* osfmk/kern/sched_prim.c */
+ 
+-volatile int sweet_boot_stage;
++volatile int    sweet_boot_stage;                   /* IOKit config threads */
+ static const char *sweet_boot_label = "start";
++volatile int    sweet_main_stage;                   /* kernel_bootstrap_thread */
++static const char *sweet_main_label = "start";
++volatile unsigned int sweet_beat;
++static unsigned int sweet_main_beat;
++static thread_t sweet_main_thread;                  /* referenced, never dropped */
++#define SWEET_SIDE_THREADS  4
++static thread_t sweet_side_threads[SWEET_SIDE_THREADS];
++static int sweet_side_count;
++static IOLock *sweet_side_lock;
++
++static uint64_t
++sweet_uptime_ms(void)
++{
++	uint64_t ns = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000000ULL;
++}
+ 
+ void
+ sweet_boot_mark(int stage, const char *label)
+ {
+-	sweet_boot_label = label;
++	uint64_t ms = sweet_uptime_ms();
++	thread_t self = current_thread();
++
++	sweet_main_label = label;
++	sweet_main_beat = sweet_beat;
++	sweet_main_stage = stage;
++	if (sweet_main_thread != self) {
++		thread_reference(self);
++		sweet_main_thread = self;
++	}
++	printf("SWEET STAGE %d: %s @%llu.%03llus\n", stage, label,
++	    (unsigned long long)(ms / 1000ULL), (unsigned long long)(ms % 1000ULL));
++	sweet_fbcon_alive(sweet_beat, stage);
++}
++
++/*
++ * Keep a reference on each IOKit config thread that marks, so the heartbeat can
++ * still read the block state of one that is parked inside a driver's start().
++ * A lost race here only leaks a reference; a thread is never stored unowned.
++ */
++static void
++sweet_side_track(thread_t self)
++{
++	int i;
++
++	if (sweet_side_lock == NULL) {
++		sweet_side_lock = IOLockAlloc();
++		if (sweet_side_lock == NULL) {
++			return;
++		}
++	}
++
++	IOLockLock(sweet_side_lock);
++	for (i = 0; i < sweet_side_count; i++) {
++		if (sweet_side_threads[i] == self) {
++			break;
++		}
++	}
++	if ((i == sweet_side_count) && (sweet_side_count < SWEET_SIDE_THREADS)) {
++		thread_reference(self);
++		sweet_side_threads[sweet_side_count++] = self;
++	}
++	IOLockUnlock(sweet_side_lock);
++}
++
++void
++sweet_boot_side_mark(int stage, const char *label)
++{
++	uint64_t ms = sweet_uptime_ms();
++	static char buf[64];
++
++	/* The caller's name may belong to a service that goes away; keep a copy. */
++	strlcpy(buf, label != NULL ? label : "?", sizeof(buf));
++	sweet_boot_label = buf;
+ 	sweet_boot_stage = stage;
+-	printf("SWEET STAGE %d: %s\n", stage, label);
+-	sweet_fbcon_alive(0, stage);
++	sweet_side_track(current_thread());
++	printf("SWEET SIDE %d: %s @%llu.%03llus\n", stage, label,
++	    (unsigned long long)(ms / 1000ULL), (unsigned long long)(ms % 1000ULL));
++}
++
++static void
++sweet_print_block(const char *who, thread_t thread)
++{
++	uint64_t event = 0;
++	uintptr_t kstack = 0;
++	int state = 0;
++
++	if ((thread != THREAD_NULL) &&
++	    sweet_thread_block_info(thread, &event, &kstack, &state)) {
++		printf(" %s blocked: wait 0x%llx state 0x%x stack 0x%lx", who,
++		    (unsigned long long) event, (unsigned int) state,
++		    (unsigned long) kstack);
++	}
+ }
+ 
+ static void
+ sweet_heartbeat(void *arg __unused, wait_result_t wr __unused)
+ {
+-	unsigned int beat = 0;
++	int jobs, threads, waiting;
++	int last_main = -1, last_side = -1, last_jobs = -1, last_threads = -1;
++	int changed;
+ 
+ 	for (;;) {
+ 		delay_for_interval(2000, 1000 * 1000);
+-		beat++;
+-		sweet_fbcon_alive(beat, sweet_boot_stage);
+-		printf("SWEET ALIVE %u: stage %d (%s)\n", beat, sweet_boot_stage, sweet_boot_label);
++		sweet_beat++;
++		sweet_fbcon_alive(sweet_beat, sweet_main_stage);
++		sweet_iokit_stats(&jobs, &threads, &waiting);
++
++		/*
++		 * Repeat every change at once, but only echo an unchanged state every
++		 * fifth beat: the screen holds a couple of dozen lines and the
++		 * per-driver trace above this report is what identifies the stall.
++		 */
++		changed = (last_main != sweet_main_stage)
++		    || (last_side != sweet_boot_stage)
++		    || (last_jobs != jobs) || (last_threads != threads);
++		last_main = sweet_main_stage;
++		last_side = sweet_boot_stage;
++		last_jobs = jobs;
++		last_threads = threads;
++		if (!changed && ((sweet_beat % 5) != 0)) {
++			continue;
++		}
++
++		printf("SWEET ALIVE %u: main %d (%s, idle %u beats) side %d (%s) iokit jobs %d threads %d wait %d",
++		    sweet_beat, sweet_main_stage, sweet_main_label,
++		    sweet_beat - sweet_main_beat, sweet_boot_stage,
++		    sweet_boot_label, jobs, threads, waiting);
++		sweet_print_block("main", sweet_main_thread);
++		if (sweet_side_count > 0) {
++			sweet_print_block("side",
++			    sweet_side_threads[sweet_side_count - 1]);
++		}
++		printf("\n");
+ 	}
+ }
+ 
+@@ -63,4 +181,5 @@
+ 		thread_deallocate(thread);
+ 	}
+ }
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -263,6 +263,9 @@
+ extern kern_return_t IOFindBSDRoot(char *, unsigned int, dev_t *, u_int32_t *);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern void sweet_boot_mark(int stage, const char *label);     /* bsd/dev/sweet_boot.c */
++#define SWEET_MARK(n, s)        sweet_boot_mark(n, s)
++#else
++#define SWEET_MARK(n, s)
+ #endif
+ extern void IOSecureBSDRoot(const char * rootName);
+ extern kern_return_t IOKitBSDInit(void );
+@@ -702,18 +705,21 @@
+ 	/* AMFI's MAC policy is built in on SWEET (bsd/kern/sweet_amfi.c). */
+ 	extern void sweet_amfi_policy_register(void);
+ 	sweet_amfi_policy_register();
++	SWEET_MARK(50, "amfi policy registered");
+ #endif
+ 
+ #if SWEET_HFS
+ 	/* HFS is built in on SWEET: register it like its kext would, before mounting root. */
+ 	extern void sweet_hfs_register(void);
+ 	sweet_hfs_register();
++	SWEET_MARK(51, "hfs registered");
+ #endif
+ 
+ #if CONFIG_PROC_UUID_POLICY
+ 	/* Initial proc_uuid_policy subsystem */
+ 	bsd_init_kprintf("calling proc_uuid_policy_init()\n");
+ 	proc_uuid_policy_init();
++	SWEET_MARK(52, "proc_uuid_policy done");
+ #endif
+ 
+ #if SOCKETS
+@@ -724,6 +730,7 @@
+ 	bsd_init_kprintf("calling mbinit\n");
+ 	mbinit();
+ 	restricted_in_port_init();
++	SWEET_MARK(53, "mbuf init done");
+ #endif /* SOCKETS */
+ 
+ 	/*
+@@ -733,26 +740,32 @@
+ #if CONFIG_AUDIT
+ 	bsd_init_kprintf("calling audit_init\n");
+ 	audit_init();
++	SWEET_MARK(54, "audit done");
+ #endif
+ 
+ 	/* Initialize kqueues */
+ 	bsd_init_kprintf("calling knote_init\n");
+ 	knote_init();
++	SWEET_MARK(55, "knote done");
+ 
+ 	/* Initialize event handler */
+ 	bsd_init_kprintf("calling eventhandler_init\n");
+ 	eventhandler_init();
++	SWEET_MARK(56, "eventhandler done");
+ 
+ 	/* Initialize for async IO */
+ 	bsd_init_kprintf("calling aio_init\n");
+ 	aio_init();
++	SWEET_MARK(57, "aio done");
+ 
+ 	pthread_init();
++	SWEET_MARK(58, "pthread init done");
+ 	/* POSIX Shm and Sem */
+ 	bsd_init_kprintf("calling pshm_cache_init\n");
+ 	pshm_cache_init();
+ 	bsd_init_kprintf("calling psem_cache_init\n");
+ 	psem_cache_init();
++	SWEET_MARK(59, "pshm/psem done");
+ 
+ 	/*
+ 	 * Initialize protocols.  Block reception of incoming packets
+@@ -761,22 +774,27 @@
+ #if NETWORKING
+ 	bsd_init_kprintf("calling nwk_wq_init\n");
+ 	nwk_wq_init();
++	SWEET_MARK(60, "nwk_wq done");
+ 	bsd_init_kprintf("calling dlil_init\n");
+ 	dlil_init();
++	SWEET_MARK(61, "dlil init done");
+ #endif /* NETWORKING */
+ #if SOCKETS
+ 	bsd_init_kprintf("calling socketinit\n");
+ 	socketinit();
++	SWEET_MARK(62, "socketinit done");
+ 	bsd_init_kprintf("calling domaininit\n");
+ 	domaininit();
+ 	iptap_init();
+ #if FLOW_DIVERT
+ 	flow_divert_init();
+ #endif  /* FLOW_DIVERT */
++	SWEET_MARK(63, "domaininit done");
+ #endif /* SOCKETS */
+ #if SKYWALK
+ 	bsd_init_kprintf("calling skywalk_init\n");
+ 	(void) skywalk_init();
++	SWEET_MARK(64, "skywalk done");
+ #endif /* SKYWALK */
+ #if NETWORKING
+ #if NECP
+@@ -784,6 +802,7 @@
+ 	necp_init();
+ #endif
+ 	netagent_init();
++	SWEET_MARK(65, "necp/netagent done");
+ #endif /* NETWORKING */
+ 
+ #if CONFIG_FREEZE
+@@ -793,18 +812,22 @@
+ 	/* Initialise background freezing */
+ 	bsd_init_kprintf("calling memorystatus_freeze_init\n");
+ 	memorystatus_freeze_init();
++	SWEET_MARK(66, "freeze init done");
+ #endif
+ 
+ #if CONFIG_MEMORYSTATUS
+ 	/* Initialize kernel memory status notifications */
+ 	bsd_init_kprintf("calling memorystatus_init\n");
+ 	memorystatus_init();
++	SWEET_MARK(67, "memorystatus done");
+ #endif /* CONFIG_MEMORYSTATUS */
+ 
+ 	bsd_init_kprintf("calling sysctl_mib_init\n");
+ 	sysctl_mib_init();
++	SWEET_MARK(68, "sysctl_mib done");
+ 
+ 	bsd_init_kprintf("calling bsd_autoconf\n");
++	SWEET_MARK(69, "calling bsd_autoconf");
+ 	bsd_autoconf();
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_boot_mark(11, "bsd_autoconf done");
+@@ -877,6 +900,7 @@
+ 
+ 	bsd_init_kprintf("calling inittodr\n");
+ 	inittodr(0);
++	SWEET_MARK(72, "network init and inittodr done");
+ 
+ 	/* Mount the root file system. */
+ 	while (TRUE) {
+@@ -1131,6 +1155,7 @@
+ bsd_autoconf(void)
+ {
+ 	kprintf("bsd_autoconf: calling kminit\n");
++	SWEET_MARK(70, "bsd_autoconf: kminit");
+ 	kminit();
+ 
+ 	/*
+@@ -1144,6 +1169,7 @@
+ 		}
+ 	}
+ 
++	SWEET_MARK(71, "bsd_autoconf: pseudo_inits done");
+ 	return IOKitBSDInit();
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -51,6 +51,8 @@
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
++extern "C" void sweet_boot_side_mark(int stage, const char *label);  /* bsd/dev/sweet_boot.c */
++
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -215,6 +217,7 @@
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
++	sweet_boot_side_mark(34, "fb work loop and vsync timer ready");
+ 	if (fScale != 0) {
+ 		/* Black out the letterbox bars (they hold the boot splash). */
+ 		for (uint32_t y = 0; y < fHeight; y++) {
+@@ -237,6 +240,7 @@
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	sweet_boot_side_mark(35, "fb vsync armed");
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -244,10 +248,12 @@
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	sweet_boot_side_mark(36, "fb service registered");
+ 	if (fScale != 0) {
+ 		IOLog("SWEET FB: canvas scaled to %ux%u at %d,%d (16.16 scale %u)\n",
+ 		    fCanvasW, fCanvasH, fPanelX, fPanelY, fScale);
+ 	}
++	sweet_boot_side_mark(37, "fb start returning");
+ 	return true;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -11,7 +11,7 @@
+ #include <IOKit/IOLib.h>
+ 
+ extern "C" {
+-void sweet_boot_mark(int stage, const char *label);      /* bsd/dev/sweet_boot.c */
++void sweet_boot_side_mark(int stage, const char *label);  /* bsd/dev/sweet_boot.c */
+ void sweet_boot_heartbeat(void);
+ }
+ 
+@@ -31,13 +31,13 @@
+ SweetPlatformExpert::start(IOService *provider)
+ {
+ 	IOLog("SWEET: starting device-tree platform expert\n");
+-	sweet_boot_mark(1, "platform expert start");
++	sweet_boot_side_mark(1, "platform expert start");
+ 	sweet_boot_heartbeat();
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
+ 	registerService();
+-	sweet_boot_mark(2, "platform expert registered");
++	sweet_boot_side_mark(2, "platform expert registered");
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
+ }
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -62,6 +62,10 @@
+ 
+ extern void OSlibkernInit(void);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++void sweet_boot_mark(int stage, const char *label);      /* bsd/dev/sweet_boot.c */
++#endif
++
+ void iokit_post_constructor_init(void);
+ 
+ SECURITY_READ_ONLY_LATE(static IOPlatformExpertDevice*) gRootNub;
+@@ -77,11 +81,17 @@
+ 	t.tv_sec = 30;
+ 	t.tv_nsec = 0;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_boot_mark(46, "waiting for IORTC resource");
++#endif
+ // RTC is not present on this target
+ #ifndef BCM2837
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
+ #endif
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_boot_mark(47, "IORTC wait finished");
++#endif
+ #if defined(__i386__) || defined(__x86_64__)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IONVRAM"), &t );
+@@ -186,6 +196,9 @@
+ 	if (__improbable(!ok)) {
+ 		panic("Failed to start IOService matching");
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_boot_mark(7, "root registerService done");
++#endif
+ 
+ #if !NO_KEXTD
+ 	if (OSKext::iokitDaemonAvailable()) {
+@@ -195,6 +208,9 @@
+ 		 * removed and personalities have been sent.
+ 		 */
+ 		IOService::getServiceRoot()->adjustBusy(1);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		sweet_boot_mark(8, "root held busy for kextd");
++#endif
+ 	}
+ #endif
+ }
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -688,11 +688,17 @@
+ 	assert(matching);
+ 	matching->setObject(gIOResourceMatchedKey, gIOBSDKey);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_boot_mark(24, "IOFindBSDRoot: waiting for IOBSD resource");
++#endif
+ 	if ((service = IOService::waitForMatchingService(matching, 30ULL * kSecondScale))) {
+ 		OSSafeReleaseNULL(service);
+ 	} else {
+ 		IOLog("!BSD\n");
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_boot_mark(25, "IOFindBSDRoot: IOBSD wait over");
++#endif
+ 	matching->release();
+ 	matching = NULL;
+ 
+diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -254,6 +254,21 @@
+ bool                            gIOKitWillTerminate;
+ bool                            gInUserspaceReboot;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern "C" {
++void sweet_boot_side_mark(int stage, const char *label);   /* bsd/dev/sweet_boot.c */
++
++/* Snapshot of the matching work queue for the boot heartbeat. */
++void
++sweet_iokit_stats(int *jobs, int *threads, int *waiting)
++{
++	*jobs = gOutstandingJobs;
++	*threads = gNumConfigThreads;
++	*waiting = gNumWaitingThreads;
++}
++}
++#endif
++
+ #define kIOServiceRootMediaParentInvalid ((IOService *) -1UL)
+ #if NO_KEXTD
+ static bool                     gIOServiceHideIOMedia = false;
+@@ -1121,6 +1136,13 @@
+ 
+ 	unlockForArbitration();
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (needConfig) {
++		IOLog("SWEET IS: startMatching %s sync=%d opts 0x%x\n",
++		    getName(), sync, options);
++	}
++#endif
++
+ 	if (needConfig) {
+ 		if (needWake) {
+ 			IOLockLock( gIOServiceBusyLock );
+@@ -1131,6 +1153,9 @@
+ 			releaseAssertion = false;
+ 			_IOServiceJob::startJob( this, kMatchNubJob, options );
+ 		} else {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			IOLog("SWEET IS: sync wait on %s\n", getName());
++#endif
+ 			do {
+ 				if ((__state[1] & kIOServiceNeedConfigState)) {
+ 					doServiceMatch( options );
+@@ -4048,6 +4073,12 @@
+ #endif
+ 				newInst = inst->probe( this, &score );
+ 				inst->detach( this );
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++				if (newInst != NULL) {
++					IOLog("SWEET IS: probe ok %s on %s\n",
++					    symbol->getCStringNoCopy(), getName());
++				}
++#endif
+ 				if (NULL == newInst) {
+ #if IOMATCHDEBUG
+ 					if (debugFlags & kIOLogProbe) {
+@@ -4848,8 +4879,19 @@
+ 		clock_get_uptime(&startTime);
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	IOLog("SWEET IS: start %s (%s)\n", service->getName(),
++	    service->getMetaClass()->getClassName());
++	sweet_boot_side_mark(32, service->getName());
++#endif
++
+ 	ok = service->start(this);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	IOLog("SWEET IS: start %s -> %d\n", service->getName(), ok);
++	sweet_boot_side_mark(33, service->getName());
++#endif
++
+ 	if (recordTime) {
+ 		clock_get_uptime(&endTime);
+ 
+@@ -5374,6 +5416,12 @@
+ 	next = this;
+ 	result = __state[1] & kIOServiceBusyStateMask;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (this == gIOServiceRoot) {
++		IOLog("SWEET IS: root busy %u + %d\n", (uint32_t) result, (int) delta);
++	}
++#endif
++
+ 	if (delta) {
+ 		do {
+ 			if (next != this) {
+@@ -5795,7 +5843,15 @@
+ 
+ 			switch (job->type) {
+ 			case kMatchNubJob:
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++				IOLog("SWEET IS: match job begin %s\n", nub->getName());
++				sweet_boot_side_mark(30, nub->getName());
++#endif
+ 				nub->doServiceMatch( job->options );
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++				IOLog("SWEET IS: match job done %s\n", nub->getName());
++				sweet_boot_side_mark(31, nub->getName());
++#endif
+ 				break;
+ 
+ 			default:
+@@ -5911,6 +5967,12 @@
+ 
+ 	IOUnlock( gJobsLock );
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	IOLog("SWEET IS: queued %s jobs=%d threads=%d waiting=%d create=%d\n",
++	    nub->getName(), gOutstandingJobs, gNumConfigThreads,
++	    gNumWaitingThreads, create);
++#endif
++
+ 	job->release();
+ 
+ 	if (create) {
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -773,6 +773,9 @@
+ 
+ #ifdef  IOKIT
+ 	kernel_bootstrap_log("PE_lockdown_iokit");
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_boot_mark(6, "calling PE_lockdown_iokit");
++#endif
+ 	PE_lockdown_iokit();
+ #endif
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -792,7 +795,7 @@
+ 	kperf_init_early();
+ #endif
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-	sweet_boot_mark(5, "kperf_init_early done");
++	sweet_boot_mark(5, "kperf done, calling bsd_init");
+ #endif
+ 
+ 	/*
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -8936,3 +8936,25 @@
+ }
+ 
+ #endif /* DEVELOPMENT || DEBUG */
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * Boot diagnostics for bsd/dev/sweet_boot.c: a photograph of a stalled boot
++ * shows a stage number, but only the wait event and kernel stack say what the
++ * bootstrap thread is actually blocked on.
++ */
++int
++sweet_thread_block_info(thread_t thread, uint64_t *event, uintptr_t *kstack,
++    int *state)
++{
++	if (thread == THREAD_NULL) {
++		return 0;
++	}
++
++	*event  = (uint64_t) thread->wait_event;
++	*kstack = (uintptr_t) thread->kernel_stack;
++	*state  = (int) thread->state;
++
++	return 1;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
