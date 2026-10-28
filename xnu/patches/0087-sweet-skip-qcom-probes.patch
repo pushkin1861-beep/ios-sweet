@@ -1,0 +1,39 @@
+diff -ruN a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c	2026-10-28 14:10:26.226499898 +0300
++++ b/bsd/dev/sweet_ufs.c	2026-10-28 15:37:09.030802543 +0300
+@@ -663,10 +663,31 @@
+ 	sweet_boot_mark(45, "ufs init: devfs nodes ready");
+ 	sweet_log_start();
+ 	sweet_sample_start();
+-	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+-	sweet_keys_init();
+-	sweet_touch_init();
+-	sweet_usb_probe();
++	/*
++	 * The keys/touch/USB probes are written for the original ios-sweet board
++	 * (Qualcomm SDM730): sweet_keys reads the SPMI arbiter at 0x0c440000,
++	 * sweet_touch the GENI SE at 0x00a84000 plus QCOM GCC at 0x00100000,
++	 * sweet_usb the same GCC and a Qualcomm DWC3/QUSB2. This board is a
++	 * Unisoc T606: those physical ranges decode to nothing, and the first
++	 * readl takes a synchronous external abort. Seen on device (603.jpg):
++	 * panic(cpu 0): Kernel data abort at _sweet_keys_init+0xac --
++	 * keys_rd(keys_core, 0) -- ESR 0x96000010 (sync external abort, read,
++	 * not a translation fault; the ml_io_map mapping itself was valid),
++	 * far = the freshly mapped VA of PA 0x0c440000.
++	 * The touch thread would hit the same abort ~45 s later, mid-userspace,
++	 * so all Qualcomm probes are off by default here; sweetprobes=1 brings
++	 * them back when this board gets its own input/USB drivers.
++	 */
++	uint32_t probes = 0;
++	(void)PE_parse_boot_argn("sweetprobes", &probes, sizeof(probes));
++	if (probes) {
++		/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
++		sweet_keys_init();
++		sweet_touch_init();
++		sweet_usb_probe();
++	} else {
++		printf("SWEET: skipping Qualcomm input/USB probes (sweetprobes=0), Unisoc drivers TBD\n");
++	}
+ 	return 0;
+ }
+ 
