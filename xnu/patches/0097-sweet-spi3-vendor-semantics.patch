@@ -1,0 +1,143 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 01:20:49.765177294 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 01:45:17.049908447 +0300
+@@ -54,7 +54,9 @@
+ #define SPI_CTL11	0x60
+ #define SPI_TX_END	(1u << 8)
+ #define SPI_RX_END	(1u << 9)
+-#define SPI_START_RX	(1u << 9)
++#define SPI_NG_TX	(1u << 1)
++#define SPI_CSN_MASK	(0xfu << 8)
++#define SPI_CS0_VALID	(1u << 8)
+ 
+ static vm_offset_t spi, gpio, syscon, apclk, pinctrl, pll1;
+ 
+@@ -98,46 +100,60 @@
+ 	return -1;
+ }
+ 
+-static void
++/* one 4-wire full-duplex transfer: clocks tx bytes out and captures the
++ * same number of bytes. Vendor spi-sprd drives RX-only transfers the same
++ * way (dummy writes), and CTL0 must keep NG_TX set for mode 0. */
++static int
++spi_xfer1(const uint8_t *tx, uint8_t *rx, unsigned len)
++{
++	uint32_t ctl0 = rd(spi, SPI_CTL0);
++	wr(spi, SPI_CTL0, ctl0 | SPI_CSN_MASK);		/* assert CS0 */
++	wr(spi, SPI_CTL8, (len & 0xf));
++	wr(spi, SPI_CTL9, (len >> 4) & 0xffff);
++	wr(spi, SPI_CTL10, (len & 0xf));
++	wr(spi, SPI_CTL11, (len >> 4) & 0xffff);
++	for (unsigned i = 0; i < len; i++) {
++		wr(spi, SPI_TXD, tx ? tx[i] : 0xff);
++	}
++	if (spi_wait_int(SPI_RX_END) != 0) {
++		wr(spi, SPI_CTL0, rd(spi, SPI_CTL0) & ~SPI_CS0_VALID);
++		return -1;
++	}
++	for (unsigned i = 0; i < len; i++) {
++		uint8_t b = (uint8_t)rd(spi, SPI_TXD);
++		if (rx) {
++			rx[i] = b;
++		}
++	}
++	wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
++	wr(spi, SPI_CTL0, rd(spi, SPI_CTL0) & ~SPI_CS0_VALID);	/* deassert */
++	return 0;
++}
++
++static int
+ spi_tx(const uint8_t *buf, unsigned len)
+ {
+-	static const uint32_t chunk = 32;
+ 	while (len) {
+-		unsigned n = len > chunk ? chunk : len;
+-		wr(spi, SPI_CTL8, n & 0xf);
+-		wr(spi, SPI_CTL9, (n >> 4) & 0xffff);
+-		for (unsigned i = 0; i < n; i++) {
+-			wr(spi, SPI_TXD, buf[i]);
+-		}
+-		if (spi_wait_int(SPI_TX_END) != 0) {
+-			return;
+-		}
+-		for (int i = 0; i < 20; i++) {
+-			if (!(rd(spi, SPI_STS2) & (1u << 8))) {
+-				break;
+-			}
+-			delay(1000);
++		unsigned n = len > 32 ? 32 : len;
++		if (spi_xfer1(buf, NULL, n) != 0) {
++			return -1;
+ 		}
+-		wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
+ 		buf += n;
+ 		len -= n;
+ 	}
++	return 0;
+ }
+ 
+ static int
+ spi_rx(uint8_t *buf, unsigned len)
+ {
+-	for (unsigned done = 0; done < len; ) {
+-		unsigned n = len - done > 32 ? 32 : len - done;
+-		wr(spi, SPI_CTL4, n | SPI_START_RX);
+-		if (spi_wait_int(SPI_RX_END) != 0) {
++	while (len) {
++		unsigned n = len > 32 ? 32 : len;
++		if (spi_xfer1(NULL, buf, n) != 0) {
+ 			return -1;
+ 		}
+-		for (unsigned i = 0; i < n; i++) {
+-			buf[done + i] = (uint8_t)rd(spi, SPI_TXD);
+-		}
+-		wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
+-		done += n;
++		buf += n;
++		len -= n;
+ 	}
+ 	return 0;
+ }
+@@ -145,12 +161,15 @@
+ static void
+ spi_init(void)
+ {
+-	wr(spi, SPI_CTL0, 0x8 | (1u << 8));	/* 8 bit, CS0 valid, mode 0 */
++	/* mode 0: CPOL=0, CPHA=0 -> NG_TX (BIT1) per vendor init_hw */
++	wr(spi, SPI_CTL0, 0x8 | SPI_NG_TX);
+ 	wr(spi, SPI_CLKD, 9);			/* 192M / ((9+1)*2) = 9.6 MHz */
+-	wr(spi, SPI_CTL5, 0);
++	wr(spi, SPI_CTL5, 9);			/* vendor minimum interval */
+ 	wr(spi, SPI_FIFO_RST, 1);
+ 	wr(spi, SPI_FIFO_RST, 0);
+-	wr(spi, SPI_CTL7, 0);			/* 4-wire */
++	wr(spi, SPI_CTL7, 0);			/* 4-wire, single data line */
++	wr(spi, SPI_CTL6, (2u << 8) | 8);	/* TX FIFO thresholds */
++	wr(spi, SPI_CTL3, (2u << 8) | 8);	/* RX FIFO thresholds */
+ 	wr(spi, SPI_INT_EN, 0);
+ 	wr(spi, SPI_INT_CLR, 0x33f);
+ }
+@@ -198,14 +217,18 @@
+ 	uint16_t hcrc = crc16(hdr, 5);
+ 	hdr[5] = hcrc & 0xff;
+ 	hdr[6] = hcrc >> 8;
+-	spi_tx(hdr, 7);
++	if (spi_tx(hdr, 7) != 0) {
++		return -1;
++	}
+ 	if (!is_read) {
+-		if (wlen) {
+-			spi_tx(wdata, wlen);
++		if (wlen && spi_tx(wdata, wlen) != 0) {
++			return -1;
+ 		}
+ 		uint16_t dcrc = crc16(wdata, wlen);
+ 		uint8_t c[2] = { dcrc & 0xff, dcrc >> 8 };
+-		spi_tx(c, 2);
++		if (spi_tx(c, 2) != 0) {
++			return -1;
++		}
+ 		uint8_t st[5];
+ 		if (spi_rx(st, 5) != 0) {
+ 			return -1;
