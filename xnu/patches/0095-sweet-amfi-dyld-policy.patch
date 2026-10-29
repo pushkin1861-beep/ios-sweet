@@ -1,0 +1,69 @@
+diff -ruN a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+--- a/bsd/kern/sweet_amfi.c	2026-10-29 15:51:04.000000000 +0300
++++ b/bsd/kern/sweet_amfi.c	2026-10-29 22:59:43.366053300 +0300
+@@ -359,6 +359,56 @@
+ 
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
++/*
++ * dyld asks AMFI (mac_syscall policy "AMFI", request 0x5a) for the dyld
++ * policy mask before it honours DYLD_* environment variables on platform
++ * binaries. Without a policy of that name the mask defaults to "restrict"
++ * and the DYLD_INSERT_LIBRARIES the kernel adds for injected processes is
++ * dropped. 0xff allows every flag. Request 0x60 (bootarg state) reports a
++ * non-enforcing machine so ExtensionKit does not require an AMFI IOKit
++ * service to verify extensions.plist.sig.
++ */
++#define AMFI_SYSCALL_CHECK_DYLD_POLICY   0x5a
++#define AMFI_DYLD_OUTPUT_ALLOW_ALL       0xffULL
++#define AMFI_SYSCALL_QUERY_BOOTARG_STATE 0x60
++#define AMFI_BOOTARG_STATE_NOT_ENFORCING 0x86ULL
++
++static int
++sweet_amfi_dyld_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	struct {
++		uint64_t input_flags;
++		user_addr_t output_flags;
++	} args;
++	uint64_t flags = AMFI_DYLD_OUTPUT_ALLOW_ALL;
++	uint64_t state = AMFI_BOOTARG_STATE_NOT_ENFORCING;
++	int error;
++
++	if (call == AMFI_SYSCALL_QUERY_BOOTARG_STATE) {
++		return copyout(&state, arg, sizeof(state));
++	}
++	if (call != AMFI_SYSCALL_CHECK_DYLD_POLICY) {
++		return ENOPOLICY;
++	}
++	error = copyin(arg, &args, sizeof(args));
++	if (error == 0) {
++		error = copyout(&flags, args.output_flags, sizeof(flags));
++	}
++	return error;
++}
++
++static const struct mac_policy_ops sweet_amfi_dyld_ops = {
++	.mpo_policy_syscall = sweet_amfi_dyld_syscall,
++};
++
++static struct mac_policy_conf sweet_amfi_dyld_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = "SWEET dyld environment policy",
++	.mpc_ops = &sweet_amfi_dyld_ops,
++};
++
++static mac_policy_handle_t sweet_amfi_dyld_handle;
++
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+ 	.mpc_name = "SWEET AMFI",
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+@@ -379,5 +429,8 @@
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	error = mac_policy_register(&sweet_amfi_dyld_conf, &sweet_amfi_dyld_handle, NULL);
++	printf("SWEET AMFI: dyld policy %s (%d)\n",
++	    error ? "NOT registered" : "registered", error);
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
