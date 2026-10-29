@@ -1,0 +1,69 @@
+diff -ruN a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+--- a/osfmk/kern/exception.c	2026-10-28 01:46:18.000000000 +0300
++++ b/osfmk/kern/exception.c	2026-10-29 12:25:40.452943966 +0300
+@@ -999,11 +999,12 @@
+ void
+ sweet_sample_task(const char *name, int pid, task_t task)
+ {
+-	vm_map_t map = get_task_map(task);
++	vm_map_t map = NULL;
+ 	uint64_t slide = 0;
+-	int tn = 0;
+ 	thread_t thread;
+ 	vm_shared_region_t sr = vm_shared_region_get(task);
++	struct sweet_regs { uint64_t pc, lr, sp, fp; } regs[64];
++	unsigned int count = 0;
+ 
+ 	if (sr != NULL) {
+ 		slide = sr->sr_slide;
+@@ -1011,19 +1012,35 @@
+ 	}
+ 	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
+ 
++	/* Under the task lock only the registers are captured; the user-memory
++	 * backtrace walk (vm_map_read_user can block on faults) and printing
++	 * happen after unlock, so the diagnostic cannot stall the sampled
++	 * process on its own task/map lock. */
+ 	task_lock(task);
++	map = get_task_map(task);
++	vm_map_reference(map);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+ 		arm_saved_state_t *ss = find_user_regs(thread);
+-		char line[400];
+-		int n;
+-		uint64_t fp;
+ 
+ 		if (ss == NULL || !is_saved_state64(ss)) {
+ 			continue;
+ 		}
+-		fp = get_saved_state_fp(ss);
+-		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
+-		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
++		if (count == sizeof(regs) / sizeof(regs[0])) {
++			break;
++		}
++		regs[count++] = (struct sweet_regs) {
++		    get_saved_state_pc(ss), get_saved_state_lr(ss),
++		    get_saved_state_sp(ss), get_saved_state_fp(ss) };
++	}
++	task_unlock(task);
++
++	for (unsigned int tn = 0; tn < count; tn++) {
++		char line[400];
++		int n;
++		uint64_t fp = regs[tn].fp;
++
++		n = snprintf(line, sizeof(line), "SMP %s t%u pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn,
++		    regs[tn].pc, regs[tn].lr, regs[tn].sp);
+ 		for (int i = 0; i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
+ 			uint64_t frame[2];
+ 			if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {
+@@ -1037,7 +1054,7 @@
+ 		}
+ 		printf("%s\n", line);
+ 	}
+-	task_unlock(task);
++	vm_map_deallocate(map);
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

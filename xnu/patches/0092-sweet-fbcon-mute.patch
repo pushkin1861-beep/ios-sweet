@@ -1,0 +1,14 @@
+diff -ruN a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c	2026-10-28 14:10:26.226499898 +0300
++++ b/pexpert/arm/pe_serial.c	2026-10-29 12:25:40.457944025 +0300
+@@ -852,6 +852,10 @@
+ void
+ sweet_fbcon_alive(unsigned int beat, int stage)
+ {
++	extern int sweet_console_muted;
++	if (sweet_console_muted) {
++		return;
++	}
+ 	if (fbcon_base == NULL || fbcon_height < 16 || fbcon_width < 256) {
+ 		return;
+ 	}

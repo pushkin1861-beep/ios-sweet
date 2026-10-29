@@ -1,0 +1,74 @@
+diff -ruN a/bsd/dev/sweet_boot.c b/bsd/dev/sweet_boot.c
+--- a/bsd/dev/sweet_boot.c	2026-10-28 22:58:15.782745482 +0300
++++ b/bsd/dev/sweet_boot.c	2026-10-29 12:26:32.810569509 +0300
+@@ -23,6 +23,7 @@
+ #include <pexpert/pexpert.h>
+ #include <string.h>
+ 
++
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ extern void sweet_fbcon_alive(unsigned int beat, int stage);   /* pexpert/arm/pe_serial.c */
+@@ -133,15 +134,18 @@
+ 
+ static int sweet_slay_killed;
+ 
++/* Runs under proc_list_lock: no proc_name()/proc_find() here. */
++static int
++sweet_slay_filter(proc_t q, __unused void *arg)
++{
++	return q != NULL && q->p_comm[0] != 0 && strcmp(q->p_comm, "lsd") == 0;
++}
++
+ static int
+ sweet_slay_cb(proc_t q, __unused void *arg)
+ {
+-	char name[32];
+-	proc_name(proc_pid(q), name, sizeof(name));
+-	if (strcmp(name, "lsd") == 0) {
+-		psignal(q, SIGKILL);
+-		sweet_slay_killed++;
+-	}
++	psignal(q, SIGKILL);
++	sweet_slay_killed++;
+ 	return PROC_RETURNED;
+ }
+ 
+@@ -149,7 +153,8 @@
+ sweet_slay_kill_lsd(void)
+ {
+ 	sweet_slay_killed = 0;
+-	proc_iterate(PROC_ALLPROCLIST, sweet_slay_cb, NULL, NULL, NULL);
++	proc_iterate(PROC_ALLPROCLIST | PROC_NOWAITTRANS,
++	    sweet_slay_cb, NULL, sweet_slay_filter, NULL);
+ 	printf("SWEET SLAY: killed %d lsd process(es)\n", sweet_slay_killed);
+ }
+ 
+@@ -158,6 +163,7 @@
+ {
+ 	static int chan;
+ 	char argbuf[64];
++	int previous = 0;
+ 	if (!PE_parse_boot_argn("sweetslay", argbuf, sizeof(argbuf))) {
+ 		return;
+ 	}
+@@ -166,12 +172,17 @@
+ 		int secs = 0;
+ 		while (*t >= '0' && *t <= '9') {
+ 			secs = secs * 10 + (*t - '0');
++			if (secs > 600) {
++				return;
++			}
+ 			t++;
+ 		}
+-		if (secs <= 0 || secs > 600) {
++		if (secs <= previous || (*t != '\0' && *t != ',')) {
+ 			break;
+ 		}
+-		(void)tsleep(&chan, PZERO, "sweetslay", hz * secs);
++		/* Absolute uptime deadlines (seconds): sleep only the delta. */
++		(void)tsleep(&chan, PZERO, "sweetslay", hz * (secs - previous));
++		previous = secs;
+ 		sweet_slay_kill_lsd();
+ 		if (*t != ',') {
+ 			break;

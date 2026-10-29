@@ -55,6 +55,17 @@ jobs:
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
           ls dxb/patches
+          # our patches are mandatory: make a failed git apply fatal instead of "Skipping patch"
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          p = Path('dxb/build.sh')
+          s = p.read_text()
+          old = '                warning "Skipping patch ${PATCH}'
+          new = '                if [[ -f "$GITHUB_WORKSPACE/xnu/patches/$(basename "$PATCH")" ]]; then\n                    echo "::error::Required patch failed: ${PATCH}: ${APPLY_CHECK}" >&2\n                    exit 1\n                fi\n                warning "Skipping patch ${PATCH}'
+          if s.count(old) != 1:
+              raise SystemExit('build.sh patch loop anchor changed')
+          p.write_text(s.replace(old, new))
+          PYCODE
 
       - name: Deps
         run: |
@@ -64,7 +75,8 @@ jobs:
           sudo chmod +x /usr/local/bin/xcodes
           sw_vers
           ls -d /Applications/Xcode*.app
-          XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          XC=$(find /Applications -maxdepth 1 -type d -name 'Xcode_15*.app' | sort -V | head -1)
+          test -n "$XC" || { echo '::error::Xcode 15.x is required for xnu-8796 iig'; exit 1; }
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"
           xcodebuild -version
