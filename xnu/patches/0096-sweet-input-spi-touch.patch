@@ -1,0 +1,410 @@
+diff -ruN a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-10-29 15:51:04.000000000 +0300
++++ b/bsd/conf/files	2026-10-30 01:05:54.341626766 +0300
+@@ -109,6 +109,7 @@
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/sweet_input.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	1970-01-01 03:00:00.000000000 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 01:05:54.342626801 +0300
+@@ -0,0 +1,376 @@
++/*
++ * (sweet) Unisoc UMS9230 input bring-up: SPRD SPI3 + ChipOne ICNL9916C
++ * touch panel over SPI, fed into the SWEET HID stack via sweet_hid_touch().
++ *
++ * Hardware facts (stock DT of X6528B and the Transsion vendor kernel):
++ *   SPI3 @0x20150000, IRQ 8, clock gate apapb "spi3-eb" = BIT(8) of the
++ *   0x20000000 syscon (set register at +0x1000), source ap-clk mul at
++ *   0x20010058 (mux [1:0] = 3 -> TWPLL_192M, divider [10:8] = 0),
++ *   reset GPIO 145 -> ap_gpio 0x641b0000 + 0x80*9 (bank 9, bit 1),
++ *   irq GPIO 16 -> ap_gpio bank 1 bit 0, panel 719x1611.
++ * The chip speaks ChipOne TCS over SPI (0xF0 write / 0xF1 read, 7-byte
++ * header with CRC16/0x8005, class/cmd word, data + ecode + crc reply).
++ *
++ * Boot-arg sweetinput: 1 = enable (default), 0 = leave the hardware alone,
++ * 2 = probe and print registers/ids only (no polling thread).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <mach/mach_types.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++
++#define SPI3_BASE	0x20150000u
++#define APAPB_SYSCON	0x20000000u
++#define AP_CLK_BASE	0x20010000u
++#define PLL1_BASE	0x645a0000u
++#define AP_GPIO_BASE	0x641b0000u
++#define PINCTRL_BASE	0x64710000u
++
++/* SPRD SPI registers (vendor spi-sprd.c) */
++#define SPI_TXD		0x00
++#define SPI_CLKD	0x04
++#define SPI_CTL0	0x08
++#define SPI_CTL1	0x0c
++#define SPI_CTL2	0x10
++#define SPI_CTL4	0x18
++#define SPI_CTL5	0x1c
++#define SPI_INT_EN	0x20
++#define SPI_INT_CLR	0x24
++#define SPI_INT_RAW	0x28
++#define SPI_STS2	0x34
++#define SPI_FIFO_RST	0x48
++#define SPI_CTL7	0x4c
++#define SPI_CTL8	0x54
++#define SPI_CTL9	0x58
++#define SPI_CTL10	0x5c
++#define SPI_CTL11	0x60
++#define SPI_TX_END	(1u << 8)
++#define SPI_RX_END	(1u << 9)
++#define SPI_START_RX	(1u << 9)
++
++static vm_offset_t spi, gpio, syscon, apclk, pinctrl, pll1;
++
++static inline uint32_t rd(vm_offset_t b, uint32_t o)
++{
++	return *(volatile uint32_t *)(b + o);
++}
++static inline void wr(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile("dmb osh" ::: "memory");
++}
++
++/* ap_gpio: 16 lines per bank, bank stride 0x80 */
++static inline void gpio_dir(vm_offset_t b, unsigned line, int out)
++{
++	uint32_t o = (line / 16) * 0x80 + 0x08;
++	uint32_t m = 1u << (line % 16);
++	wr(b, o, out ? (rd(b, o) | m) : (rd(b, o) & ~m));
++}
++static inline void gpio_dat(vm_offset_t b, unsigned line, int val)
++{
++	uint32_t o = (line / 16) * 0x80;
++	uint32_t m = 1u << (line % 16);
++	wr(b, o, val ? (rd(b, o) | m) : (rd(b, o) & ~m));
++}
++
++/* --- SPI3 polled engine ------------------------------------------------ */
++static int spi_timeout_ms;
++
++static int
++spi_wait_int(uint32_t mask)
++{
++	for (int i = 0; i < 20; i++) {
++		if (rd(spi, SPI_INT_RAW) & mask) {
++			return 0;
++		}
++		delay(1000);
++	}
++	spi_timeout_ms++;
++	return -1;
++}
++
++static void
++spi_tx(const uint8_t *buf, unsigned len)
++{
++	static const uint32_t chunk = 32;
++	while (len) {
++		unsigned n = len > chunk ? chunk : len;
++		wr(spi, SPI_CTL8, n & 0xf);
++		wr(spi, SPI_CTL9, (n >> 4) & 0xffff);
++		for (unsigned i = 0; i < n; i++) {
++			wr(spi, SPI_TXD, buf[i]);
++		}
++		if (spi_wait_int(SPI_TX_END) != 0) {
++			return;
++		}
++		for (int i = 0; i < 20; i++) {
++			if (!(rd(spi, SPI_STS2) & (1u << 8))) {
++				break;
++			}
++			delay(1000);
++		}
++		wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
++		buf += n;
++		len -= n;
++	}
++}
++
++static int
++spi_rx(uint8_t *buf, unsigned len)
++{
++	for (unsigned done = 0; done < len; ) {
++		unsigned n = len - done > 32 ? 32 : len - done;
++		wr(spi, SPI_CTL4, n | SPI_START_RX);
++		if (spi_wait_int(SPI_RX_END) != 0) {
++			return -1;
++		}
++		for (unsigned i = 0; i < n; i++) {
++			buf[done + i] = (uint8_t)rd(spi, SPI_TXD);
++		}
++		wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
++		done += n;
++	}
++	return 0;
++}
++
++static void
++spi_init(void)
++{
++	wr(spi, SPI_CTL0, 0x8 | (1u << 8));	/* 8 bit, CS0 valid, mode 0 */
++	wr(spi, SPI_CLKD, 9);			/* 192M / ((9+1)*2) = 9.6 MHz */
++	wr(spi, SPI_CTL5, 0);
++	wr(spi, SPI_FIFO_RST, 1);
++	wr(spi, SPI_FIFO_RST, 0);
++	wr(spi, SPI_CTL7, 0);			/* 4-wire */
++	wr(spi, SPI_INT_EN, 0);
++	wr(spi, SPI_INT_CLR, 0x33f);
++}
++
++/* --- ChipOne TCS over SPI ---------------------------------------------- */
++static uint16_t
++crc16(const uint8_t *p, unsigned len)
++{
++	uint16_t crc = 0;
++	while (len--) {
++		crc ^= (uint16_t)(*p++) << 8;
++		for (int i = 0; i < 8; i++) {
++			crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x8005)
++					     : (uint16_t)(crc << 1);
++		}
++	}
++	return crc;
++}
++
++#define TCS_ADDR_WRITE	0xf0
++#define TCS_ADDR_READ	0xf1
++#define TCS_RW_WRITE	(0u << 13)
++#define TCS_RW_READ	(1u << 14)
++
++static uint16_t
++tcs_cmd(uint16_t class, uint16_t id, int is_read)
++{
++	return (uint16_t)((is_read ? TCS_RW_READ : TCS_RW_WRITE) |
++	    (uint16_t)(class << 8) | (id & 0xff));
++}
++
++static int
++tcs_xfer(uint16_t class, uint16_t id, int is_read, const uint8_t *wdata,
++    unsigned wlen, uint8_t *rdata, unsigned rlen)
++{
++	uint8_t hdr[7];
++	unsigned dlen = is_read ? rlen : wlen;
++	uint16_t cmd = tcs_cmd(class, id, is_read);
++
++	hdr[0] = is_read ? TCS_ADDR_READ : TCS_ADDR_WRITE;
++	hdr[1] = cmd & 0xff;
++	hdr[2] = cmd >> 8;
++	hdr[3] = dlen & 0xff;
++	hdr[4] = dlen >> 8;
++	uint16_t hcrc = crc16(hdr, 5);
++	hdr[5] = hcrc & 0xff;
++	hdr[6] = hcrc >> 8;
++	spi_tx(hdr, 7);
++	if (!is_read) {
++		if (wlen) {
++			spi_tx(wdata, wlen);
++		}
++		uint16_t dcrc = crc16(wdata, wlen);
++		uint8_t c[2] = { dcrc & 0xff, dcrc >> 8 };
++		spi_tx(c, 2);
++		uint8_t st[5];
++		if (spi_rx(st, 5) != 0) {
++			return -1;
++		}
++		return st[0] == 0 ? 0 : -1;
++	}
++	delay(100);
++	uint8_t buf[192];
++	if (rlen + 5 > sizeof(buf)) {
++		return -1;
++	}
++	if (spi_rx(buf, rlen + 5) != 0) {
++		return -1;
++	}
++	if (buf[rlen] != 0) {		/* ecode */
++		return -1;
++	}
++	if (crc16(buf, rlen + 3) != (uint16_t)(buf[rlen + 3] | (buf[rlen + 4] << 8))) {
++		return -2;
++	}
++	memcpy(rdata, buf, rlen);
++	return 0;
++}
++
++static int
++tcs_read8(uint16_t class, uint16_t id, uint8_t *out, unsigned len)
++{
++	return tcs_xfer(class, id, 1, NULL, 0, out, len);
++}
++
++/* --- init/probe --------------------------------------------------------- */
++static uint32_t tinfo_res_x = 719, tinfo_res_y = 1611;
++static int touch_probed_ok;
++static int touch_events_printed;
++
++static void
++touch_reset(void)
++{
++	gpio_dir(gpio, 145, 1);
++	gpio_dir(gpio, 16, 0);		/* irq input */
++	gpio_dat(gpio, 145, 1);
++	delay(1000);
++	gpio_dat(gpio, 145, 0);
++	delay(10000);
++	gpio_dat(gpio, 145, 1);
++	delay(40000);
++}
++
++static void
++touch_probe(void)
++{
++	uint8_t xy[8];
++	int err = tcs_read8(0, 7, xy, sizeof(xy));	/* XY info */
++
++	printf("SWEET TOUCH: regs ctl0=%x clkd=%x gate=%x apclk58=%x pll0=%x pads=%x,%x,%x inf=%x,%x,%x\n",
++	    rd(spi, SPI_CTL0), rd(spi, SPI_CLKD),
++	    rd(syscon, 0x0000), rd(apclk, 0x58), rd(pll1, 0x00),
++	    rd(pinctrl, 0x138), rd(pinctrl, 0x13c), rd(pinctrl, 0x140),
++	    rd(pinctrl, 0x14), rd(pinctrl, 0x18), rd(pinctrl, 0x1c));
++	if (err == 0) {
++		uint16_t rx = (uint16_t)(xy[0] | (xy[1] << 8));
++		uint16_t ry = (uint16_t)(xy[2] | (xy[3] << 8));
++		printf("SWEET TOUCH: icnl9916 XY info raw %02x %02x %02x %02x %02x %02x %02x %02x res %ux%u\n",
++		    xy[0], xy[1], xy[2], xy[3], xy[4], xy[5], xy[6], xy[7], rx, ry);
++		if (rx >= 200 && rx <= 4000 && ry >= 200 && ry <= 4000) {
++			tinfo_res_x = rx;
++			tinfo_res_y = ry;
++			touch_probed_ok = 1;
++		}
++	} else {
++		printf("SWEET TOUCH: XY info read failed (%d), spi_timeouts %d\n",
++		    err, spi_timeout_ms);
++	}
++}
++
++struct tcs_point {
++	uint8_t id;
++	uint16_t x;
++	uint16_t y;
++	uint8_t pressure;
++	uint8_t event;
++} __attribute__((packed));
++
++static void
++touch_poll_once(void)
++{
++	uint8_t pkt[112];
++	if (tcs_read8(1, 3, pkt, sizeof(pkt)) != 0) {
++		return;
++	}
++	uint8_t num = pkt[1];
++	if (num == 0 || num > 10) {
++		return;
++	}
++	for (unsigned i = 0; i < num; i++) {
++		struct tcs_point pt;
++		memcpy(&pt, pkt + 2 + i * sizeof(pt), sizeof(pt));
++		if (pt.event != 1 && pt.event != 2 && pt.event != 4) {
++			continue;
++		}
++		int x = pt.x, y = pt.y;
++		x = x < 0 ? 0 : (x >= (int)tinfo_res_x ? (int)tinfo_res_x - 1 : x);
++		y = y < 0 ? 0 : (y >= (int)tinfo_res_y ? (int)tinfo_res_y - 1 : y);
++		sweet_hid_touch(pt.id & 0xf, pt.event != 4, x, y);
++		if (touch_events_printed < 6) {
++			printf("SWEET TOUCH: ev id %u %s x %d y %d\n",
++			    pt.id, pt.event == 4 ? "up" : "down", x, y);
++			touch_events_printed++;
++		}
++	}
++}
++
++static void
++sweet_input_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	static int chan;
++	for (;;) {
++		if (touch_probed_ok) {
++			touch_poll_once();
++		}
++		uint32_t ticks = hz / 100;
++		if (ticks == 0) {
++			ticks = 1;
++		}
++		(void)tsleep(&chan, PZERO, "sweetinput", ticks);
++	}
++}
++
++void
++sweet_input_init(void)
++{
++	uint32_t mode = 1;
++	(void)PE_parse_boot_argn("sweetinput", &mode, sizeof(mode));
++	if (mode == 0) {
++		return;
++	}
++	spi = ml_io_map(SPI3_BASE, 0x1000);
++	gpio = ml_io_map(AP_GPIO_BASE, 0x10000);
++	syscon = ml_io_map(APAPB_SYSCON, 0x3000);
++	apclk = ml_io_map(AP_CLK_BASE, 0x1000);
++	pinctrl = ml_io_map(PINCTRL_BASE, 0x10000);
++	pll1 = ml_io_map(PLL1_BASE, 0x1000);
++	if (!spi || !gpio || !syscon || !apclk || !pinctrl || !pll1) {
++		printf("SWEET TOUCH: ml_io_map failed\n");
++		return;
++	}
++
++	/* clocks: gate spi3-eb (set reg +0x1000 BIT8); ap-spi3 mux=3 div=0 */
++	wr(syscon, 0x1000, 1u << 8);
++	uint32_t c58 = rd(apclk, 0x58);
++	wr(apclk, 0x58, (c58 & ~((3u) | (7u << 8))) | 3u);
++	delay(1000);
++
++	touch_reset();
++	spi_init();
++	touch_probe();
++
++	if (!touch_probed_ok) {
++		printf("SWEET TOUCH: probe failed, polling thread not started\n");
++		return;
++	}
++	if (mode == 2) {
++		return;
++	}
++	thread_t th;
++	if (kernel_thread_start(sweet_input_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++		printf("SWEET TOUCH: polling thread started (%ux%u)\n",
++		    tinfo_res_x, tinfo_res_y);
++	}
++}
+diff -ruN a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c	2026-10-29 15:51:04.000000000 +0300
++++ b/bsd/kern/bsd_init.c	2026-10-30 01:05:54.342626801 +0300
+@@ -265,6 +265,7 @@
+ extern void sweet_boot_mark(int stage, const char *label);     /* bsd/dev/sweet_boot.c */
+ extern void sweet_wdt_disarm(void);                            /* bsd/dev/sweet_boot.c */
+ extern void sweet_slay_start(void);                            /* bsd/dev/sweet_boot.c */
++extern void sweet_input_init(void);                            /* bsd/dev/sweet_input.c */
+ #define SWEET_MARK(n, s)        sweet_boot_mark(n, s)
+ #else
+ #define SWEET_MARK(n, s)
+@@ -498,6 +499,7 @@
+ 	sweet_boot_mark(10, "bsd_init enter");
+ 	sweet_wdt_disarm(); /* sprd AP watchdog: LK arms it, Android feeds it, we're on our own (bsd/dev/sweet_boot.c) */
+ 	sweet_slay_start(); /* boot-arg sweetslay=<secs,...>: kill a wedged daemon (bring-up) */
++	sweet_input_init(); /* SPI3 ChipOne touch bring-up (bsd/dev/sweet_input.c) */
+ #endif
+ 
+ #if (DEVELOPMENT || DEBUG)
