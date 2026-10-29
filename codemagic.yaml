@@ -9,7 +9,13 @@ workflows:
     environment:
       xcode: 15.4
       groups: []
+      vars:
+        DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+        DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
     scripts:
+      - name: deps (brew)
+        script: |
+          brew install -q jq gum bash cmake ninja || true
       - name: checkout dxb (darwin-xnu-build)
         script: |
           git init -q dxb
