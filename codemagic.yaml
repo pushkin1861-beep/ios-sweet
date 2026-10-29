@@ -7,7 +7,7 @@ workflows:
     max_build_duration: 110
     instance_type: mac_mini_m2
     environment:
-      xcode: 15.4
+      xcode: latest
       groups: []
       vars:
         DXB_REPO: https://github.com/blacktop/darwin-xnu-build
@@ -41,9 +41,10 @@ workflows:
           PYCODE
       - name: Xcode 15.x select
         script: |
+          echo "=== установленные Xcode ==="
           ls -d /Applications/Xcode*.app
           XC=$(find /Applications -maxdepth 1 -type d -name 'Xcode_15*.app' | sort -V | head -1)
-          test -n "$XC" || { echo "ERROR: Xcode 15.x required"; exit 1; }
+          test -n "$XC" || { echo "ERROR: Xcode 15.x отсутствует (см. список выше)"; exit 1; }
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> $CM_ENV
           sudo xcode-select -s "$XC"
           xcodebuild -version
