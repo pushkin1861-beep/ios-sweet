@@ -1,7 +1,22 @@
 diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
 --- a/bsd/dev/sweet_input.c	2026-10-30 01:20:49.765177294 +0300
-+++ b/bsd/dev/sweet_input.c	2026-10-30 01:45:17.049908447 +0300
-@@ -54,7 +54,9 @@
++++ b/bsd/dev/sweet_input.c	2026-10-30 02:35:01.304736048 +0300
+@@ -40,12 +40,14 @@
+ #define SPI_CTL0	0x08
+ #define SPI_CTL1	0x0c
+ #define SPI_CTL2	0x10
++#define SPI_CTL3	0x14
+ #define SPI_CTL4	0x18
+ #define SPI_CTL5	0x1c
+ #define SPI_INT_EN	0x20
+ #define SPI_INT_CLR	0x24
+ #define SPI_INT_RAW	0x28
+ #define SPI_STS2	0x34
++#define SPI_CTL6	0x40
+ #define SPI_FIFO_RST	0x48
+ #define SPI_CTL7	0x4c
+ #define SPI_CTL8	0x54
+@@ -54,7 +56,9 @@
  #define SPI_CTL11	0x60
  #define SPI_TX_END	(1u << 8)
  #define SPI_RX_END	(1u << 9)
@@ -12,7 +27,7 @@ diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
  
  static vm_offset_t spi, gpio, syscon, apclk, pinctrl, pll1;
  
-@@ -98,46 +100,60 @@
+@@ -98,46 +102,60 @@
  	return -1;
  }
  
@@ -99,7 +114,7 @@ diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
  	}
  	return 0;
  }
-@@ -145,12 +161,15 @@
+@@ -145,12 +163,15 @@
  static void
  spi_init(void)
  {
@@ -118,7 +133,7 @@ diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
  	wr(spi, SPI_INT_EN, 0);
  	wr(spi, SPI_INT_CLR, 0x33f);
  }
-@@ -198,14 +217,18 @@
+@@ -198,14 +219,18 @@
  	uint16_t hcrc = crc16(hdr, 5);
  	hdr[5] = hcrc & 0xff;
  	hdr[6] = hcrc >> 8;
