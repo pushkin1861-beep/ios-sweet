@@ -1,0 +1,95 @@
+diff -ruN a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c	2026-10-28 01:46:17.000000000 +0300
++++ b/bsd/kern/kern_exec.c	2026-10-29 14:33:55.128105447 +0300
+@@ -5568,6 +5568,59 @@
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
+  */
++/*
++ * (sweet) Bring-up aid: the boot-arg execinject holds "LIBRARY,NAME[,NAME...]"; every
++ * program whose file name is one of the NAMEs is started with DYLD_INSERT_LIBRARIES=LIBRARY
++ * in its environment, so that dyld loads our library into it (dyld takes several libraries
++ * separated by ":" inside the one LIBRARY). launchd refuses to pass DYLD_ variables from a
++ * job description, which is why the kernel adds this one itself, here in
++ * exec_extract_strings, ahead of every environment string the caller passed; nothing
++ * filters DYLD_ out afterwards. The whole configuration is one string, hence the buffer
++ * (512 bytes have been lost to silent truncation before).
++ */
++static TUNABLE_STR(exec_inject_conf, 4096, "execinject", "");
++
++static bool
++exec_inject_env(struct image_params *imgp, const char **libsp)
++{
++	const char *p = exec_inject_conf;
++	const char *libs, *name;
++	size_t liblen, namelen;
++
++	libs = p;
++	while (*p != 0 && *p != ',') {
++		p++;
++	}
++	liblen = (size_t)(p - libs);
++	if (liblen == 0 || *p == 0) {
++		return false;
++	}
++	p++;
++	if (imgp->ip_ndp == NULL) {
++		return false;
++	}
++	name = imgp->ip_ndp->ni_cnd.cn_nameptr;
++	namelen = imgp->ip_ndp->ni_cnd.cn_namelen;
++	if (namelen == 0) {
++		return false;
++	}
++	while (*p != 0) {
++		const char *word = p;
++
++		while (*p != 0 && *p != ',') {
++			p++;
++		}
++		if ((size_t)(p - word) == namelen && strncmp(word, name, namelen) == 0) {
++			*libsp = libs;
++			return true;
++		}
++		if (*p == ',') {
++			p++;
++		}
++	}
++	return false;
++}
++
+ __attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+@@ -5713,6 +5766,31 @@
+ 	imgp->ip_endargv = imgp->ip_strendp;
+ 	imgp->ip_envc = 0;
+ 
++	/*
++	 * (sweet) one variable of ours, ahead of every env string the caller passed
++	 * (see exec_inject_env); the name DYLD_INSERT_LIBRARIES= and the libraries are
++	 * added in two pieces that end up next to each other as the one string.
++	 */
++	{
++		const char *inject_libs;
++
++		if (exec_inject_env(imgp, &inject_libs)) {
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T("DYLD_INSERT_LIBRARIES="), UIO_SYSSPACE, TRUE);
++			if (error == 0) {
++				error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject_libs), UIO_SYSSPACE, TRUE);
++			}
++			if (error) {
++				goto bad;
++			}
++			if (imgp->ip_argspace < new_ptr_size) {
++				error = E2BIG;
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size; /* to hold envv[] entry */
++			imgp->ip_envc++;
++		}
++	}
++
+ 	/* Now, get the environment */
+ 	while (envv != 0LL) {
+ 		user_addr_t     env;
