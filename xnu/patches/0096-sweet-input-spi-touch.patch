@@ -11,8 +11,8 @@ diff -ruN a/bsd/conf/files b/bsd/conf/files
  bsd/dev/sweet_usb.c			standard
 diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
 --- a/bsd/dev/sweet_input.c	1970-01-01 03:00:00.000000000 +0300
-+++ b/bsd/dev/sweet_input.c	2026-10-30 01:05:54.342626801 +0300
-@@ -0,0 +1,376 @@
++++ b/bsd/dev/sweet_input.c	2026-10-30 01:20:49.765177294 +0300
+@@ -0,0 +1,379 @@
 +/*
 + * (sweet) Unisoc UMS9230 input bring-up: SPRD SPI3 + ChipOne ICNL9916C
 + * touch panel over SPI, fed into the SWEET HID stack via sweet_hid_touch().
@@ -38,6 +38,9 @@ diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern int hz;
++
++void sweet_input_init(void);
 +
 +#define SPI3_BASE	0x20150000u
 +#define APAPB_SYSCON	0x20000000u
