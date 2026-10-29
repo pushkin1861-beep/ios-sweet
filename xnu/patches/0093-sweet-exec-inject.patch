@@ -227,7 +227,7 @@ index cb67b4d..7fd7b86 100644
  		return 0;
  	}
 +	proc_t proc = current_proc();
-+	if (proc != PROC_NULL && cred == kauth_cred_get()) {
++	if (proc != NULL && cred == kauth_cred_get()) {
 +		for (size_t i = 0; i < sizeof(sweet_sandbox_privileges) / sizeof(sweet_sandbox_privileges[0]); i++) {
 +			if (sweet_sandbox_privileges[i].priv == priv) {
 +				if (sweet_amfi_query_boolean_with_proc(proc, sweet_sandbox_privileges[i].entitlement) == KERN_SUCCESS) {

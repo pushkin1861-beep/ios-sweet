@@ -12,10 +12,15 @@ workflows:
       vars:
         DXB_REPO: https://github.com/blacktop/darwin-xnu-build
         DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+        MACOS_VERSION: "13.5"
+        KERNEL_CONFIG: DEVELOPMENT
+        MACHINE_CONFIG: SWEET
     scripts:
       - name: deps (brew)
         script: |
           brew install -q jq gum bash cmake ninja || true
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
       - name: checkout dxb (darwin-xnu-build)
         script: |
           git init -q dxb
@@ -39,12 +44,15 @@ workflows:
               raise SystemExit('build.sh patch loop anchor changed')
           p.write_text(s.replace(old, new))
           PYCODE
-      - name: Xcode 15.x select
+      - name: Xcode select
         script: |
           echo "=== установленные Xcode ==="
           ls -d /Applications/Xcode*.app
           XC=$(find /Applications -maxdepth 1 -type d -name 'Xcode_15*.app' | sort -V | head -1)
-          test -n "$XC" || { echo "ERROR: Xcode 15.x отсутствует (см. список выше)"; exit 1; }
+          if [ -z "$XC" ]; then
+            XC=$(find /Applications -maxdepth 1 -type d -name 'Xcode*.app' | sort -V | head -1)
+          fi
+          test -n "$XC" || { echo "ERROR: Xcode отсутствует"; exit 1; }
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> $CM_ENV
           sudo xcode-select -s "$XC"
           xcodebuild -version
