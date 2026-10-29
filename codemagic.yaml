@@ -30,7 +30,7 @@ workflows:
           p = Path('dxb/build.sh')
           s = p.read_text()
           old = '                warning "Skipping patch ${PATCH}'
-          new = ('                if [[ -f "$GITHUB_WORKSPACE/xnu/patches/$(basename "$PATCH")" ]]; then\n'
+          new = ('                if [[ -f "${GITHUB_WORKSPACE:-$CM_BUILD_DIR}/xnu/patches/$(basename "$PATCH")" ]]; then\n'
                  '                    echo "ERROR Required patch failed: ${PATCH}: ${APPLY_CHECK}" >&2\n'
                  '                    exit 1\n'
                  '                fi\n'

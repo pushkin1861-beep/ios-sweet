@@ -59,12 +59,19 @@ def d22ap_product(path=D22AP_ADT):
     root, _ = adt.parse(open(path, 'rb').read())
     for c in root.children:
         if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
-            return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
+            # Override artwork-display-gamut from P3 to sRGB so MobileGestalt
+            # reports HasExtendedColorDisplay = false (8-bit BGRA surfaces).
+            return [
+                (k, b'sRGB\0' if k == 'artwork-display-gamut' else v)
+                for k, f, v in c.props
+                if not f and k not in ('name', 'AAPL,phandle')
+            ]
     raise SystemExit(f'{path}: no /product node')
 
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
 u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
 cstr = lambda s: s.encode() + b'\0'
+cstr_pad = lambda s, n=32: s.encode().ljust(n, b'\0')
 
 
 def node(name, props=(), children=()):
@@ -110,9 +117,16 @@ def build(seed=None, qemu=False, highmem=False):
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
         # files), so e.g. DataMigration never records LastSystemVersion and
         # migrates on every boot. Synthetic ECID (not the phone's); chip-id
-        # of the A11 that the iPhone X userland expects.
+        # and board-id of the A11/D22AP that the iPhone X userland expects.
         ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
         ('chip-id', u32(0x8015)),
+        ('board-id', u32(0x06)),
+        # MobileGestalt requires 6-byte Wi-Fi and Bluetooth MAC addresses in
+        # /chosen (plus serial-number and mlb-serial-number on the root node)
+        # to compute UniqueDeviceID (SHA1(Serial + ECID + WiFiMAC + BTMAC)).
+        ('mac-address-wifi0', bytes([0x02, 0x53, 0x57, 0x45, 0x00, 0x01])),
+        ('mac-address-bluetooth0', bytes([0x02, 0x53, 0x57, 0x45, 0x00, 0x02])),
+        ('software-behavior', bytes(16)),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
         # DeviceType then takes its native "Hactivation" branch (state
@@ -120,6 +134,7 @@ def build(seed=None, qemu=False, highmem=False):
         ('certificate-production-status', u32(0)),
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
+        ('effective-security-mode-ap', u32(1)),
         ('effective-security-mode-sep', u32(1)),
     ], [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
@@ -236,6 +251,12 @@ def build(seed=None, qemu=False, highmem=False):
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
         ('manufacturer', cstr('Apple Inc.')),
+        ('platform-name', cstr_pad('t8015')),
+        ('serial-number', cstr_pad('F2LUMMY00001')),
+        ('mlb-serial-number', cstr_pad('F2L00000001UMMY1A')),
+        ('model-number', cstr_pad('MQAC2')),
+        ('region-info', cstr_pad('LL/A')),
+        ('regulatory-model-number', cstr_pad('A1865')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
     ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
