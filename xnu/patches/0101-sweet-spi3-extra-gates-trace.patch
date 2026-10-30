@@ -1,0 +1,50 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 03:57:30.764118182 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 04:16:11.766400195 +0300
+@@ -299,6 +299,27 @@
+ 	delay(40000);
+ }
+ 
++/* One byte with status samples: proves whether the-shift engine ever
++ * becomes busy (functional clock present) before any TCS traffic. */
++static void
++spi_trace_one(void)
++{
++	wr(spi, SPI_CTL0, rd(spi, SPI_CTL0) | SPI_CSN_MASK);
++	uint32_t ctl1 = rd(spi, SPI_CTL1);
++	wr(spi, SPI_CTL1, (ctl1 & ~(SPI_TX_MODE | SPI_RX_MODE)) | SPI_TX_MODE);
++	wr(spi, SPI_CTL8, 1);
++	wr(spi, SPI_CTL9, 0);
++	wr(spi, SPI_TXD, 0x00);
++	for (int i = 0; i < 6; i++) {
++		delay(1000);
++		printf("SWEET TOUCH: trace t%u raw=%x sts2=%x\n", i + 1,
++		    rd(spi, SPI_INT_RAW), rd(spi, SPI_STS2));
++	}
++	wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
++	wr(spi, SPI_CTL1, rd(spi, SPI_CTL1) & ~(SPI_TX_MODE | SPI_RX_MODE));
++	wr(spi, SPI_CTL0, rd(spi, SPI_CTL0) & ~SPI_CS0_VALID);
++}
++
+ static void
+ touch_probe(void)
+ {
+@@ -399,14 +420,16 @@
+ 		return;
+ 	}
+ 
+-	/* clocks: gate spi3-eb (set reg +0x1000 BIT8); ap-spi3 mux=3 div=0 */
+-	wr(syscon, 0x1000, 1u << 8);
++	/* clocks: gate spi3-eb (BIT8), apb-reg-eb (BIT4) and the low-frequency
++	 * input gate spi3-lfin-eb (BIT21) via the apapb set register */
++	wr(syscon, 0x1000, (1u << 8) | (1u << 4) | (1u << 21));
+ 	uint32_t c58 = rd(apclk, 0x58);
+ 	wr(apclk, 0x58, (c58 & ~((3u) | (7u << 8))) | 3u);
+ 	delay(1000);
+ 
+ 	touch_reset();
+ 	spi_init(0, 0);
++	spi_trace_one();
+ 	touch_probe();
+ 	if (!touch_probed_ok) {
+ 		touch_reset();
