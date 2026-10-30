@@ -1,0 +1,16 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 04:16:11.766400195 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 04:39:59.047725149 +0300
+@@ -420,9 +420,9 @@
+ 		return;
+ 	}
+ 
+-	/* clocks: gate spi3-eb (BIT8), apb-reg-eb (BIT4) and the low-frequency
+-	 * input gate spi3-lfin-eb (BIT21) via the apapb set register */
+-	wr(syscon, 0x1000, (1u << 8) | (1u << 4) | (1u << 21));
++	/* clocks: gate spi3-eb only (BIT8). Writing apb-reg-eb/lfin here wedged
++	 * the early boot: those gates belong to other APB blocks on this SoC. */
++	wr(syscon, 0x1000, 1u << 8);
+ 	uint32_t c58 = rd(apclk, 0x58);
+ 	wr(apclk, 0x58, (c58 & ~((3u) | (7u << 8))) | 3u);
+ 	delay(1000);
