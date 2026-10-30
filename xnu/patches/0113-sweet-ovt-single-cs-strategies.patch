@@ -1,0 +1,258 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 13:30:05.986550744 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 20:08:43.889247305 +0300
+@@ -177,36 +177,44 @@
+ /* Vendor PIO RX: RX_MODE with the length in CTL10/11 and dummy TX bytes
+  * clocking the bus (spi-sprd txrx_bufs, RX branch). If the END bit does not
+  * arrive, retry once through CTL4 START_RX, which some revisions prefer. */
++/* RX core without touching CS: the caller owns the CS cycle. */
+ static int
+-spi_rx(uint8_t *buf, unsigned len)
++spi_rx_core(uint8_t *buf, unsigned n)
+ {
+-	while (len) {
+-		unsigned n = len > 32 ? 32 : len;
+-		spi_dir(SPI_RX_MODE);
+-		spi_cs(1);
++	spi_dir(SPI_RX_MODE);
++	wr(spi, SPI_FIFO_RST, 1);
++	wr(spi, SPI_FIFO_RST, 0);
++	spi_lens(0, n);
++	for (unsigned i = 0; i < n; i++) {
++		wrb(spi, SPI_TXD, 0xff);
++	}
++	int err = spi_wait_raw(SPI_RX_END);
++	if (err != 0) {
++		wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
+ 		wr(spi, SPI_FIFO_RST, 1);
+ 		wr(spi, SPI_FIFO_RST, 0);
+ 		spi_lens(0, n);
++		wr(spi, SPI_CTL4, n | SPI_START_RX);
++		err = spi_wait_raw(SPI_RX_END);
++	}
++	if (err == 0) {
+ 		for (unsigned i = 0; i < n; i++) {
+-			wrb(spi, SPI_TXD, 0xff);
+-		}
+-		int err = spi_wait_raw(SPI_RX_END);
+-		if (err != 0) {
+-			wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
+-			wr(spi, SPI_FIFO_RST, 1);
+-			wr(spi, SPI_FIFO_RST, 0);
+-			spi_lens(0, n);
+-			wr(spi, SPI_CTL4, n | SPI_START_RX);
+-			err = spi_wait_raw(SPI_RX_END);
++			buf[i] = rdb(spi, SPI_TXD);
+ 		}
+-		if (err == 0) {
+-			for (unsigned i = 0; i < n; i++) {
+-				buf[i] = rdb(spi, SPI_TXD);
+-			}
+-		}
+-		wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
++	}
++	wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
++	spi_dir(0);
++	return err;
++}
++
++static int
++spi_rx(uint8_t *buf, unsigned len)
++{
++	while (len) {
++		unsigned n = len > 32 ? 32 : len;
++		spi_cs(1);
++		int err = spi_rx_core(buf, n);
+ 		spi_cs(0);
+-		spi_dir(0);
+ 		if (err != 0) {
+ 			return err;
+ 		}
+@@ -456,9 +464,9 @@
+ 	/* reset-on-state = 0: assert low 20 ms, release high 200 ms */
+ 	gpio_dir(gpio, 145, 1);
+ 	gpio_dat(gpio, 145, 0);
+-	delay(20000);
++	delay(100000);
+ 	gpio_dat(gpio, 145, 1);
+-	delay(200000);
++	delay(300000);
+ }
+ 
+ static int
+@@ -485,52 +493,104 @@
+ }
+ 
+ static void
+-ovt_probe(void)
++ovt_hex(const char *tag, const uint8_t *b, unsigned n)
+ {
+-	uint8_t id[64];
+-	unsigned plen = 0;
+-	uint8_t buf[128];
++	printf("SWEET TOUCH: %s", tag);
++	for (unsigned i = 0; i < n; i++) {
++		printf(" %02x", b[i]);
++	}
++	printf("\n");
++}
+ 
+-	/* A: one continued read of remaining+2 = 22 bytes (vendor shape) */
+-	if (ovt_identify(id, &plen) == 0) {
+-		delay(100);
+-		int ok = ovt_read(buf, 22) == 0 && buf[0] == 0xa5 && buf[1] == 0x03;
+-		printf("SWEET TOUCH: ovt A %s %02x %02x %02x %02x %02x %02x %02x %02x\n",
+-		    ok ? "ok" : "fail", buf[0], buf[1], buf[2], buf[3], buf[4],
+-		    buf[5], buf[6], buf[7]);
+-		if (ok) {
+-			memcpy(id + 5, buf + 2, 19);
+-			goto parsed;
+-		}
++/* V1: whole 29-byte message in one CS cycle (header is 4 + 24 payload + 5A). */
++static int
++ovt_try_single(uint8_t *id)
++{
++	uint8_t buf[32];
++	ovt_reset();
++	spi_cs(1);
++	int err = spi_rx_core(buf, 29);
++	spi_cs(0);
++	ovt_hex(err == 0 ? "ovt V1 raw" : "ovt V1 fail", buf, 12);
++	if (err != 0 || buf[0] != 0xa5 || buf[1] != 0x10) {
++		return -1;
+ 	}
+-	/* B: A5 03 header (2 bytes) then the 20 remaining bytes */
+-	if (ovt_identify(id, &plen) == 0) {
+-		delay(500);
+-		uint8_t h2[2];
+-		int ok = ovt_read(h2, 2) == 0 && h2[0] == 0xa5;
+-		printf("SWEET TOUCH: ovt B hdr %s %02x %02x\n",
+-		    ok ? "ok" : "fail", h2[0], h2[1]);
+-		if (ok && ovt_read(buf, 20) == 0) {
+-			memcpy(id + 5, buf, 19);
+-			goto parsed;
+-		}
++	unsigned plen = buf[2] | (buf[3] << 8);
++	if (plen != 24 || buf[28] != 0x5a) {
++		printf("SWEET TOUCH: ovt V1 plen=%u pad=%02x\n", plen, buf[28]);
++		return -1;
+ 	}
+-	/* C: the device may stream just the 20 remaining bytes on a new CS */
+-	if (ovt_identify(id, &plen) == 0) {
+-		delay(500);
+-		int ok = ovt_read(buf, 20) == 0;
+-		printf("SWEET TOUCH: ovt C %s %02x %02x %02x %02x %02x %02x %02x %02x\n",
+-		    ok ? "ok" : "fail", buf[0], buf[1], buf[2], buf[3], buf[4],
+-		    buf[5], buf[6], buf[7]);
+-		if (ok) {
+-			memcpy(id + 5, buf, 19);
+-			goto parsed;
+-		}
++	memcpy(id, buf + 4, 24);
++	return 0;
++}
++
++/* V2: header 9 bytes then the 22-byte continuation with CS held low. */
++static int
++ovt_try_hold(uint8_t *id)
++{
++	uint8_t hdr[9];
++	uint8_t cont[22];
++	ovt_reset();
++	spi_cs(1);
++	int err = spi_rx_core(hdr, 9);
++	if (err == 0) {
++		err = spi_rx_core(cont, 22);
++	}
++	spi_cs(0);
++	ovt_hex(err == 0 ? "ovt V2 hdr" : "ovt V2 fail", hdr, 6);
++	if (err != 0 || hdr[0] != 0xa5 || hdr[1] != 0x10) {
++		return -1;
++	}
++	ovt_hex("ovt V2 cont", cont, 6);
++	if (cont[0] != 0xa5 || cont[1] != 0x03 || cont[21] != 0x5a) {
++		return -1;
++	}
++	memcpy(id, hdr + 4, 5);
++	memcpy(id + 5, cont + 2, 19);
++	return 0;
++}
++
++/* V3: separate CS for the continuation (vendor driver shape). */
++static int
++ovt_try_toggle(uint8_t *id)
++{
++	uint8_t hdr[9];
++	uint8_t cont[22];
++	ovt_reset();
++	if (spi_rx(hdr, 9) != 0 || hdr[0] != 0xa5 || hdr[1] != 0x10) {
++		printf("SWEET TOUCH: ovt V3 hdr failed\n");
++		return -1;
++	}
++	delay(100);
++	if (spi_rx(cont, 22) != 0) {
++		printf("SWEET TOUCH: ovt V3 cont failed\n");
++		return -1;
+ 	}
+-	printf("SWEET TOUCH: ovt all body strategies failed to=%d\n", spi_timeout_ms);
+-	return;
++	ovt_hex("ovt V3 cont", cont, 6);
++	if (cont[0] != 0xa5 || cont[1] != 0x03) {
++		return -1;
++	}
++	memcpy(id, hdr + 4, 5);
++	memcpy(id + 5, cont + 2, 19);
++	return 0;
++}
++
++static void
++ovt_probe(void)
++{
++	uint8_t id[32];
++	uint8_t buf[128];
+ 
+-parsed:
++	spi_init(1, 1, 31);	/* mode 3, 3 MHz */
++	if (ovt_try_single(id) != 0 && ovt_try_hold(id) != 0 &&
++	    ovt_try_toggle(id) != 0) {
++		spi_init(1, 1, 63);	/* 1.5 MHz last resort */
++		if (ovt_try_single(id) != 0) {
++			printf("SWEET TOUCH: ovt all strategies failed to=%d\n",
++			    spi_timeout_ms);
++			return;
++		}
++	}
+ 	printf("SWEET TOUCH: ovt id ver=%u mode=%x part=%.16s build=%x\n",
+ 	    id[0], id[1], (char *)(id + 2),
+ 	    id[18] | (id[19] << 8) | (id[20] << 16) | ((uint32_t)id[21] << 24));
+@@ -539,22 +599,19 @@
+ 		return;
+ 	}
+ 	uint8_t cmd[3] = { 0x20, 0x00, 0x00 };
+-	if (spi_tx(cmd, 3) != 0 || ovt_read(buf, 4) != 0) {
++	if (spi_tx(cmd, 3) != 0) {
+ 		printf("SWEET TOUCH: ovt app-info request failed\n");
+ 		return;
+ 	}
+-	unsigned alen = buf[2] | (buf[3] << 8);
+-	if (buf[0] != 0xa5 || buf[1] != 0x01 || alen > 100) {
+-		printf("SWEET TOUCH: ovt app-info hdr %02x %02x len %u\n",
+-		    buf[0], buf[1], alen);
+-		return;
+-	}
+-	if (ovt_read(buf + 4, alen + 1) != 0) {
+-		printf("SWEET TOUCH: ovt app-info body failed\n");
++	spi_cs(1);
++	int err = spi_rx_core(buf, 53);	/* A5 01 30 00 + 48 + 5A */
++	spi_cs(0);
++	if (err != 0 || buf[0] != 0xa5 || buf[1] != 0x01 || buf[52] != 0x5a) {
++		ovt_hex("ovt app raw", buf, 8);
++		printf("SWEET TOUCH: ovt app-info read failed\n");
+ 		return;
+ 	}
+-	printf("SWEET TOUCH: ovt app status=%u max=%ux%u objects=%u cfg=%u pl=%u\n",
+-	    buf[6] | (buf[7] << 8),
++	printf("SWEET TOUCH: ovt app max=%ux%u objects=%u cfg=%u pl=%u\n",
+ 	    buf[36] | (buf[37] << 8), buf[38] | (buf[39] << 8),
+ 	    buf[40] | (buf[41] << 8), buf[16] | (buf[17] << 8),
+ 	    buf[18] | (buf[19] << 8));
