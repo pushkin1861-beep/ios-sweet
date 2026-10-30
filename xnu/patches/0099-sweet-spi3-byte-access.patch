@@ -1,0 +1,48 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 03:09:48.708662771 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 03:35:33.367082666 +0300
+@@ -73,6 +73,16 @@
+ 	*(volatile uint32_t *)(b + o) = v;
+ 	__asm__ volatile("dmb osh" ::: "memory");
+ }
++/* 8-bit data width uses byte accesses on the FIFO port (vendor writeb/readb) */
++static inline void wrb(vm_offset_t b, uint32_t o, uint8_t v)
++{
++	*(volatile uint8_t *)(b + o) = v;
++	__asm__ volatile("dmb osh" ::: "memory");
++}
++static inline uint8_t rdb(vm_offset_t b, uint32_t o)
++{
++	return *(volatile uint8_t *)(b + o);
++}
+ 
+ /* ap_gpio: 16 lines per bank, bank stride 0x80 */
+ static inline void gpio_dir(vm_offset_t b, unsigned line, int out)
+@@ -122,13 +132,13 @@
+ 	wr(spi, SPI_CTL10, (len & 0xf));
+ 	wr(spi, SPI_CTL11, (len >> 4) & 0xffff);
+ 	for (unsigned i = 0; i < len; i++) {
+-		wr(spi, SPI_TXD, tx ? tx[i] : 0xff);
++		wrb(spi, SPI_TXD, tx ? tx[i] : 0xff);
+ 	}
+ 	uint32_t wait = rx ? SPI_RX_END : SPI_TX_END;
+ 	int err = spi_wait_int(wait);
+ 	if (err == 0 && rx) {
+ 		for (unsigned i = 0; i < len; i++) {
+-			rx[i] = (uint8_t)rd(spi, SPI_TXD);
++			rx[i] = rdb(spi, SPI_TXD);
+ 		}
+ 	}
+ 	wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
+@@ -306,8 +316,9 @@
+ 			touch_probed_ok = 1;
+ 		}
+ 	} else {
+-		printf("SWEET TOUCH: XY info read failed (%d), spi_timeouts %d\n",
+-		    err, spi_timeout_ms);
++		printf("SWEET TOUCH: XY info read failed (%d), spi_timeouts %d ctl1=%x raw=%x sts1=%x sts2=%x ien=%x\n",
++		    err, spi_timeout_ms, rd(spi, SPI_CTL1), rd(spi, SPI_INT_RAW),
++		    rd(spi, 0x30), rd(spi, SPI_STS2), rd(spi, SPI_INT_EN));
+ 	}
+ }
+ 
