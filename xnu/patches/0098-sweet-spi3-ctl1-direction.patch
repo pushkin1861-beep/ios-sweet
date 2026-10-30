@@ -1,0 +1,81 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 02:35:01.304736048 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 03:09:48.708662771 +0300
+@@ -59,6 +59,8 @@
+ #define SPI_NG_TX	(1u << 1)
+ #define SPI_CSN_MASK	(0xfu << 8)
+ #define SPI_CS0_VALID	(1u << 8)
++#define SPI_TX_MODE	(1u << 13)
++#define SPI_RX_MODE	(1u << 12)
+ 
+ static vm_offset_t spi, gpio, syscon, apclk, pinctrl, pll1;
+ 
+@@ -102,14 +104,19 @@
+ 	return -1;
+ }
+ 
+-/* one 4-wire full-duplex transfer: clocks tx bytes out and captures the
+- * same number of bytes. Vendor spi-sprd drives RX-only transfers the same
+- * way (dummy writes), and CTL0 must keep NG_TX set for mode 0. */
++/* One 4-wire transfer following vendor spi-sprd exactly: CTL1 carries the
++ * direction (TX_MODE for writes, RX_MODE for reads; both for full duplex),
++ * TX length lives in CTL8/9 and RX length in CTL10/11, and RX-only mode
++ * still pushes dummy bytes to generate the clock. */
+ static int
+ spi_xfer1(const uint8_t *tx, uint8_t *rx, unsigned len)
+ {
++	uint32_t mode = (tx ? SPI_TX_MODE : 0) | (rx ? SPI_RX_MODE : 0);
+ 	uint32_t ctl0 = rd(spi, SPI_CTL0);
++
+ 	wr(spi, SPI_CTL0, ctl0 | SPI_CSN_MASK);		/* assert CS0 */
++	uint32_t ctl1 = rd(spi, SPI_CTL1);
++	wr(spi, SPI_CTL1, (ctl1 & ~(SPI_TX_MODE | SPI_RX_MODE)) | mode);
+ 	wr(spi, SPI_CTL8, (len & 0xf));
+ 	wr(spi, SPI_CTL9, (len >> 4) & 0xffff);
+ 	wr(spi, SPI_CTL10, (len & 0xf));
+@@ -117,19 +124,17 @@
+ 	for (unsigned i = 0; i < len; i++) {
+ 		wr(spi, SPI_TXD, tx ? tx[i] : 0xff);
+ 	}
+-	if (spi_wait_int(SPI_RX_END) != 0) {
+-		wr(spi, SPI_CTL0, rd(spi, SPI_CTL0) & ~SPI_CS0_VALID);
+-		return -1;
+-	}
+-	for (unsigned i = 0; i < len; i++) {
+-		uint8_t b = (uint8_t)rd(spi, SPI_TXD);
+-		if (rx) {
+-			rx[i] = b;
++	uint32_t wait = rx ? SPI_RX_END : SPI_TX_END;
++	int err = spi_wait_int(wait);
++	if (err == 0 && rx) {
++		for (unsigned i = 0; i < len; i++) {
++			rx[i] = (uint8_t)rd(spi, SPI_TXD);
+ 		}
+ 	}
+ 	wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
+-	wr(spi, SPI_CTL0, rd(spi, SPI_CTL0) & ~SPI_CS0_VALID);	/* deassert */
+-	return 0;
++	wr(spi, SPI_CTL1, rd(spi, SPI_CTL1) & ~(SPI_TX_MODE | SPI_RX_MODE));
++	wr(spi, SPI_CTL0, rd(spi, SPI_CTL0) & ~SPI_CS0_VALID);
++	return err;
+ }
+ 
+ static int
+@@ -389,6 +394,17 @@
+ 	touch_probe();
+ 
+ 	if (!touch_probed_ok) {
++		/* fallback: source = ext-26m (13 MHz on the wire), in case the
++		 * 192M path is not actually reaching the controller */
++		uint32_t c58 = rd(apclk, 0x58);
++		wr(apclk, 0x58, c58 & ~3u);
++		wr(spi, SPI_CLKD, 0);
++		delay(1000);
++		touch_reset();
++		spi_init();
++		touch_probe();
++	}
++	if (!touch_probed_ok) {
+ 		printf("SWEET TOUCH: probe failed, polling thread not started\n");
+ 		return;
+ 	}
