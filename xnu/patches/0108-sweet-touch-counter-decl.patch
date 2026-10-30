@@ -1,0 +1,20 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 10:46:35.358207705 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 11:24:39.319255345 +0300
+@@ -238,6 +238,8 @@
+ }
+ 
+ /* --- ChipOne TCS over SPI ---------------------------------------------- */
++static int touch_events_printed;
++
+ static uint16_t
+ crc16(const uint8_t *p, unsigned len)
+ {
+@@ -351,7 +353,6 @@
+ /* --- init/probe --------------------------------------------------------- */
+ static uint32_t tinfo_res_x = 719, tinfo_res_y = 1611;
+ static int touch_probed_ok;
+-static int touch_events_printed;
+ 
+ static void
+ touch_reset(void)
