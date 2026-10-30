@@ -1,0 +1,38 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 10:20:13.235948193 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 10:40:20.644645095 +0300
+@@ -293,11 +293,18 @@
+ 	if (spi_rx(buf, rlen + 5) != 0) {
+ 		return -1;
+ 	}
+-	if (buf[rlen] != 0) {		/* ecode */
+-		return -1;
+-	}
+-	if (crc16(buf, rlen + 3) != (uint16_t)(buf[rlen + 3] | (buf[rlen + 4] << 8))) {
+-		return -2;
++	if (buf[rlen] != 0 || crc16(buf, rlen + 3) !=
++	    (uint16_t)(buf[rlen + 3] | (buf[rlen + 4] << 8))) {
++		unsigned show = rlen + 5 > 16 ? 16 : rlen + 5;
++		printf("SWEET TOUCH: tcs rd c%u cmd%u ecode=%x crc=%s:", class, id,
++		    buf[rlen],
++		    crc16(buf, rlen + 3) == (uint16_t)(buf[rlen + 3] | (buf[rlen + 4] << 8))
++		        ? "ok" : "bad");
++		for (unsigned i = 0; i < show; i++) {
++			printf(" %02x", buf[i]);
++		}
++		printf("\n");
++		return buf[rlen] != 0 ? -1 : -2;
+ 	}
+ 	memcpy(rdata, buf, rlen);
+ 	return 0;
+@@ -351,6 +358,10 @@
+ static void
+ touch_probe(void)
+ {
++	uint8_t fw[4];
++	int fwerr = tcs_read8(0, 3, fw, sizeof(fw));	/* FW id, vendor first cmd */
++	printf("SWEET TOUCH: fw id %s %02x %02x %02x %02x\n",
++	    fwerr == 0 ? "ok" : "fail", fw[0], fw[1], fw[2], fw[3]);
+ 	uint8_t xy[8];
+ 	int err = tcs_read8(0, 7, xy, sizeof(xy));	/* XY info */
+ 
