@@ -1,0 +1,38 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 12:42:40.833032611 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 13:04:07.842776655 +0300
+@@ -479,12 +479,31 @@
+ 	if (rest + 2 > sizeof(buf)) {
+ 		return;
+ 	}
+-	if (ovt_read(buf, rest + 2) != 0) {
+-		printf("SWEET TOUCH: ovt identify body read failed\n");
++	uint8_t *id = buf + 2;			/* payload starts after A5 03 */
++	int got = -1;
++	/* A: one continued read of rest+2 (vendor shape) */
++	delay(100);
++	if (ovt_read(buf, rest + 2) == 0 && buf[0] == 0xa5 && buf[1] == 0x03) {
++		got = 0;
++	}
++	/* B: two-step: A5 03 header, then the rest */
++	if (got != 0) {
++		delay(1000);
++		uint8_t h2[2];
++		if (ovt_read(h2, 2) == 0 && h2[0] == 0xa5) {
++			if (ovt_read(buf + 2, rest) == 0) {
++				buf[0] = h2[0];
++				buf[1] = h2[1];
++				got = 0;
++			}
++		}
++	}
++	if (got != 0) {
++		printf("SWEET TOUCH: ovt body failed raw=%x sts2=%x to=%d\n",
++		    rd(spi, SPI_INT_RAW), rd(spi, SPI_STS2), spi_timeout_ms);
+ 		return;
+ 	}
+ 	printf("SWEET TOUCH: ovt cont %02x %02x\n", buf[0], buf[1]);
+-	uint8_t *id = buf + 2;			/* payload starts after A5 03 */
+ 	printf("SWEET TOUCH: ovt id ver=%u mode=%x part=%.16s build=%x\n",
+ 	    id[0], id[1], (char *)(id + 2),
+ 	    id[18] | (id[19] << 8) | (id[20] << 16) | ((uint32_t)id[21] << 24));
