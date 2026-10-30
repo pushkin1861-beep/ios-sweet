@@ -25,8 +25,8 @@ concurrency:
   # Per commit: re-dispatching the same commit replaces its own queued build,
   # but a new dispatch must not cancel a build of another commit that is
   # already waiting for a (scarce) macOS runner.
-  group: xnu-${{ github.ref }}-${{ github.sha }}
-  cancel-in-progress: true
+  group: xnu-${{ github.ref }}-${{ github.sha }}-${{ github.run_id }}
+  cancel-in-progress: false
 
 env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
