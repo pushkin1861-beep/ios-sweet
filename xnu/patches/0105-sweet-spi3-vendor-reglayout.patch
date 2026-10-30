@@ -1,0 +1,229 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 10:08:18.224745322 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 10:20:13.235948193 +0300
+@@ -62,6 +62,7 @@
+ #define SPI_CSN_MASK	(0xfu << 8)
+ #define SPI_CS0_VALID	(1u << 8)
+ #define SPI_TX_MODE	(1u << 13)
++#define SPI_START_RX	(1u << 9)
+ #define SPI_RX_MODE	(1u << 12)
+ 
+ static vm_offset_t spi, gpio, syscon, apclk, pinctrl, pll1;
+@@ -100,13 +101,15 @@
+ 	wr(b, o, val ? (rd(b, o) | m) : (rd(b, o) & ~m));
+ }
+ 
+-/* --- SPI3 polled engine ------------------------------------------------ */
++/* --- SPRD SPI3 polled engine (vendor sc9860/sharkl5 semantics) --------- */
+ static int spi_timeout_ms;
+ 
+ static int
+-spi_wait_int(uint32_t mask)
++spi_wait_raw(uint32_t mask)
+ {
+-	for (int i = 0; i < 20; i++) {
++	/* END bits latch in INT_RAW; BUSY is a sub-microsecond pulse at 9.6 MHz
++	 * and is useless to poll, so only the latched END bits are used. */
++	for (int i = 0; i < 5; i++) {
+ 		if (rd(spi, SPI_INT_RAW) & mask) {
+ 			return 0;
+ 		}
+@@ -116,37 +119,33 @@
+ 	return -1;
+ }
+ 
+-/* One 4-wire transfer following vendor spi-sprd exactly: CTL1 carries the
+- * direction (TX_MODE for writes, RX_MODE for reads; both for full duplex),
+- * TX length lives in CTL8/9 and RX length in CTL10/11, and RX-only mode
+- * still pushes dummy bytes to generate the clock. */
+-static int
+-spi_xfer1(const uint8_t *tx, uint8_t *rx, unsigned len)
++/* CTL0[6:2] = bits per word, [11:8] = CSn levels (0 = low/active),
++ * bit13 = CPOL, bit1/bit0 = NG_TX/NG_RX (CPHA select). */
++static void
++spi_cs(int asserted)
+ {
+-	uint32_t mode = (tx ? SPI_TX_MODE : 0) | (rx ? SPI_RX_MODE : 0);
+-	uint32_t ctl0 = rd(spi, SPI_CTL0);
++	uint32_t ctl0 = rd(spi, SPI_CTL0) | SPI_CSN_MASK;	/* all high */
++	if (asserted) {
++		ctl0 &= ~SPI_CS0_VALID;
++	}
++	wr(spi, SPI_CTL0, ctl0);
++}
+ 
+-	wr(spi, SPI_CTL0, ctl0 | SPI_CSN_MASK);		/* assert CS0 */
++/* CTL8[3:0]/CTL9 = TX length[19:0]; CTL10[3:0]/CTL11 = RX length[19:0] */
++static void
++spi_lens(unsigned txlen, unsigned rxlen)
++{
++	wr(spi, SPI_CTL8, (txlen >> 16) & 0xf);
++	wr(spi, SPI_CTL9, txlen & 0xffff);
++	wr(spi, SPI_CTL10, (rxlen >> 16) & 0xf);
++	wr(spi, SPI_CTL11, rxlen & 0xffff);
++}
++
++static void
++spi_dir(uint32_t mode)
++{
+ 	uint32_t ctl1 = rd(spi, SPI_CTL1);
+ 	wr(spi, SPI_CTL1, (ctl1 & ~(SPI_TX_MODE | SPI_RX_MODE)) | mode);
+-	wr(spi, SPI_CTL8, (len & 0xf));
+-	wr(spi, SPI_CTL9, (len >> 4) & 0xffff);
+-	wr(spi, SPI_CTL10, (len & 0xf));
+-	wr(spi, SPI_CTL11, (len >> 4) & 0xffff);
+-	for (unsigned i = 0; i < len; i++) {
+-		wrb(spi, SPI_TXD, tx ? tx[i] : 0xff);
+-	}
+-	uint32_t wait = rx ? SPI_RX_END : SPI_TX_END;
+-	int err = spi_wait_int(wait);
+-	if (err == 0 && rx) {
+-		for (unsigned i = 0; i < len; i++) {
+-			rx[i] = rdb(spi, SPI_TXD);
+-		}
+-	}
+-	wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
+-	wr(spi, SPI_CTL1, rd(spi, SPI_CTL1) & ~(SPI_TX_MODE | SPI_RX_MODE));
+-	wr(spi, SPI_CTL0, rd(spi, SPI_CTL0) & ~SPI_CS0_VALID);
+-	return err;
+ }
+ 
+ static int
+@@ -154,8 +153,20 @@
+ {
+ 	while (len) {
+ 		unsigned n = len > 32 ? 32 : len;
+-		if (spi_xfer1(buf, NULL, n) != 0) {
+-			return -1;
++		spi_dir(SPI_TX_MODE);
++		spi_cs(1);
++		wr(spi, SPI_FIFO_RST, 1);
++		wr(spi, SPI_FIFO_RST, 0);
++		spi_lens(n, 0);
++		for (unsigned i = 0; i < n; i++) {
++			wrb(spi, SPI_TXD, buf[i]);
++		}
++		int err = spi_wait_raw(SPI_TX_END);
++		wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
++		spi_cs(0);
++		spi_dir(0);
++		if (err != 0) {
++			return err;
+ 		}
+ 		buf += n;
+ 		len -= n;
+@@ -168,8 +179,23 @@
+ {
+ 	while (len) {
+ 		unsigned n = len > 32 ? 32 : len;
+-		if (spi_xfer1(NULL, buf, n) != 0) {
+-			return -1;
++		spi_dir(SPI_RX_MODE);
++		spi_cs(1);
++		wr(spi, SPI_FIFO_RST, 1);
++		wr(spi, SPI_FIFO_RST, 0);
++		spi_lens(0, n);
++		wr(spi, SPI_CTL4, n | SPI_START_RX);	/* len[8:0], start bit9 */
++		int err = spi_wait_raw(SPI_RX_END);
++		if (err == 0) {
++			for (unsigned i = 0; i < n; i++) {
++				buf[i] = rdb(spi, SPI_TXD);
++			}
++		}
++		wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
++		spi_cs(0);
++		spi_dir(0);
++		if (err != 0) {
++			return err;
+ 		}
+ 		buf += n;
+ 		len -= n;
+@@ -177,16 +203,18 @@
+ 	return 0;
+ }
+ 
+-/* Vendor board DTS puts spi-cpha on the touch node, so try CPHA first;
+- * CPHA selects NG_RX instead of NG_TX in CTL0 (vendor init_hw). */
++/* Vendor board DTS puts spi-cpha on the touch node, so CPHA picks NG_RX
++ * instead of NG_TX in CTL0 (vendor sprd_spi_init_hw). */
+ static void
+ spi_init(int cpol, int cpha)
+ {
+-	uint32_t ctl0 = 0x8 | (cpha ? SPI_NG_RX : SPI_NG_TX) |
++	uint32_t ctl0 = (8u << 2) | SPI_CSN_MASK |
++	    (cpha ? SPI_NG_RX : SPI_NG_TX) |
+ 	    (cpol ? SPI_SCK_REV : 0);
++	wr(spi, SPI_CTL2, 0);			/* PIO mode, master */
+ 	wr(spi, SPI_CTL0, ctl0);
+ 	wr(spi, SPI_CLKD, 9);			/* 192M / ((9+1)*2) = 9.6 MHz */
+-	wr(spi, SPI_CTL5, 9);			/* vendor minimum interval */
++	wr(spi, SPI_CTL5, 9);			/* vendor minimum word interval */
+ 	wr(spi, SPI_FIFO_RST, 1);
+ 	wr(spi, SPI_FIFO_RST, 0);
+ 	wr(spi, SPI_CTL7, 0);			/* 4-wire, single data line */
+@@ -304,20 +332,20 @@
+ static void
+ spi_trace_one(void)
+ {
+-	wr(spi, SPI_CTL0, rd(spi, SPI_CTL0) | SPI_CSN_MASK);
+-	uint32_t ctl1 = rd(spi, SPI_CTL1);
+-	wr(spi, SPI_CTL1, (ctl1 & ~(SPI_TX_MODE | SPI_RX_MODE)) | SPI_TX_MODE);
+-	wr(spi, SPI_CTL8, 1);
+-	wr(spi, SPI_CTL9, 0);
+-	wr(spi, SPI_TXD, 0x00);
++	spi_dir(SPI_TX_MODE);
++	spi_cs(1);
++	wr(spi, SPI_FIFO_RST, 1);
++	wr(spi, SPI_FIFO_RST, 0);
++	spi_lens(1, 0);
++	wrb(spi, SPI_TXD, 0x00);
+ 	for (int i = 0; i < 6; i++) {
+ 		delay(1000);
+ 		printf("SWEET TOUCH: trace t%u raw=%x sts2=%x\n", i + 1,
+ 		    rd(spi, SPI_INT_RAW), rd(spi, SPI_STS2));
+ 	}
+ 	wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
+-	wr(spi, SPI_CTL1, rd(spi, SPI_CTL1) & ~(SPI_TX_MODE | SPI_RX_MODE));
+-	wr(spi, SPI_CTL0, rd(spi, SPI_CTL0) & ~SPI_CS0_VALID);
++	spi_cs(0);
++	spi_dir(0);
+ }
+ 
+ static void
+@@ -417,26 +445,18 @@
+ static int
+ spi_bus_alive(uint32_t off)
+ {
+-	/* returns 0 when the controller reports a completed transfer */
+-	wr(spi, SPI_CTL0, rd(spi, SPI_CTL0) | SPI_CSN_MASK);
+-	uint32_t ctl1 = rd(spi, SPI_CTL1);
+-	wr(spi, SPI_CTL1, (ctl1 & ~(SPI_TX_MODE | SPI_RX_MODE)) | SPI_TX_MODE);
+-	wr(spi, SPI_CTL8, 1);
+-	wr(spi, SPI_CTL9, 0);
+-	wr(spi, SPI_TXD, 0x00);
+-	int ok = -1;
+-	for (int i = 0; i < 3; i++) {
+-		delay(1000);
+-		if (rd(spi, SPI_INT_RAW) & SPI_TX_END) {
+-			ok = 0;
+-			break;
+-		}
+-	}
++	spi_dir(SPI_TX_MODE);
++	spi_cs(1);
++	wr(spi, SPI_FIFO_RST, 1);
++	wr(spi, SPI_FIFO_RST, 0);
++	spi_lens(1, 0);
++	wrb(spi, SPI_TXD, 0x00);
++	int ok = spi_wait_raw(SPI_TX_END);
+ 	uint32_t raw = rd(spi, SPI_INT_RAW), sts2 = rd(spi, SPI_STS2);
+ 	wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
+-	wr(spi, SPI_CTL1, rd(spi, SPI_CTL1) & ~(SPI_TX_MODE | SPI_RX_MODE));
+-	wr(spi, SPI_CTL0, rd(spi, SPI_CTL0) & ~SPI_CS0_VALID);
+-	printf("SWEET TOUCH: bus%u raw=%x sts2=%x %s\n", off, raw, sts2,
++	spi_cs(0);
++	spi_dir(0);
++	printf("SWEET TOUCH: bus reg%x raw=%x sts2=%x %s\n", off, raw, sts2,
+ 	    ok == 0 ? "ALIVE" : "dead");
+ 	return ok;
+ }
