@@ -1,0 +1,177 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 10:40:20.644645095 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 10:46:35.358207705 +0300
+@@ -174,6 +174,9 @@
+ 	return 0;
+ }
+ 
++/* Vendor PIO RX: RX_MODE with the length in CTL10/11 and dummy TX bytes
++ * clocking the bus (spi-sprd txrx_bufs, RX branch). If the END bit does not
++ * arrive, retry once through CTL4 START_RX, which some revisions prefer. */
+ static int
+ spi_rx(uint8_t *buf, unsigned len)
+ {
+@@ -184,8 +187,18 @@
+ 		wr(spi, SPI_FIFO_RST, 1);
+ 		wr(spi, SPI_FIFO_RST, 0);
+ 		spi_lens(0, n);
+-		wr(spi, SPI_CTL4, n | SPI_START_RX);	/* len[8:0], start bit9 */
++		for (unsigned i = 0; i < n; i++) {
++			wrb(spi, SPI_TXD, 0xff);
++		}
+ 		int err = spi_wait_raw(SPI_RX_END);
++		if (err != 0) {
++			wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
++			wr(spi, SPI_FIFO_RST, 1);
++			wr(spi, SPI_FIFO_RST, 0);
++			spi_lens(0, n);
++			wr(spi, SPI_CTL4, n | SPI_START_RX);
++			err = spi_wait_raw(SPI_RX_END);
++		}
+ 		if (err == 0) {
+ 			for (unsigned i = 0; i < n; i++) {
+ 				buf[i] = rdb(spi, SPI_TXD);
+@@ -206,14 +219,14 @@
+ /* Vendor board DTS puts spi-cpha on the touch node, so CPHA picks NG_RX
+  * instead of NG_TX in CTL0 (vendor sprd_spi_init_hw). */
+ static void
+-spi_init(int cpol, int cpha)
++spi_init(int cpol, int cpha, int clkdiv)
+ {
+ 	uint32_t ctl0 = (8u << 2) | SPI_CSN_MASK |
+ 	    (cpha ? SPI_NG_RX : SPI_NG_TX) |
+ 	    (cpol ? SPI_SCK_REV : 0);
+ 	wr(spi, SPI_CTL2, 0);			/* PIO mode, master */
+ 	wr(spi, SPI_CTL0, ctl0);
+-	wr(spi, SPI_CLKD, 9);			/* 192M / ((9+1)*2) = 9.6 MHz */
++	wr(spi, SPI_CLKD, clkdiv);		/* 192M / ((div+1)*2): 9 -> 9.6 MHz, 15 -> 6 MHz */
+ 	wr(spi, SPI_CTL5, 9);			/* vendor minimum word interval */
+ 	wr(spi, SPI_FIFO_RST, 1);
+ 	wr(spi, SPI_FIFO_RST, 0);
+@@ -267,23 +280,36 @@
+ 	uint16_t hcrc = crc16(hdr, 5);
+ 	hdr[5] = hcrc & 0xff;
+ 	hdr[6] = hcrc >> 8;
+-	if (spi_tx(hdr, 7) != 0) {
+-		return -1;
+-	}
++
+ 	if (!is_read) {
+-		if (wlen && spi_tx(wdata, wlen) != 0) {
++		/* header + data + data crc go out in a single CS cycle
++		 * (cts_tcs_spi_write_pack builds one spi_transfer) */
++		uint8_t tx[7 + 32 + 2];
++		unsigned n = 0;
++		if (wlen > 32) {
+ 			return -1;
+ 		}
+-		uint16_t dcrc = crc16(wdata, wlen);
+-		uint8_t c[2] = { dcrc & 0xff, dcrc >> 8 };
+-		if (spi_tx(c, 2) != 0) {
++		memcpy(tx, hdr, 7);
++		n = 7;
++		if (wlen) {
++			memcpy(tx + n, wdata, wlen);
++			n += wlen;
++			uint16_t dcrc = crc16(wdata, wlen);
++			tx[n++] = dcrc & 0xff;
++			tx[n++] = dcrc >> 8;
++		}
++		if (spi_tx(tx, n) != 0) {
+ 			return -1;
+ 		}
+ 		uint8_t st[5];
+ 		if (spi_rx(st, 5) != 0) {
+ 			return -1;
+ 		}
+-		return st[0] == 0 ? 0 : -1;
++		return 0;	/* vendor ignores ecode/cmd on SPI writes */
++	}
++
++	if (spi_tx(hdr, 7) != 0) {
++		return -1;
+ 	}
+ 	delay(100);
+ 	uint8_t buf[192];
+@@ -293,18 +319,24 @@
+ 	if (spi_rx(buf, rlen + 5) != 0) {
+ 		return -1;
+ 	}
+-	if (buf[rlen] != 0 || crc16(buf, rlen + 3) !=
+-	    (uint16_t)(buf[rlen + 3] | (buf[rlen + 4] << 8))) {
+-		unsigned show = rlen + 5 > 16 ? 16 : rlen + 5;
+-		printf("SWEET TOUCH: tcs rd c%u cmd%u ecode=%x crc=%s:", class, id,
+-		    buf[rlen],
+-		    crc16(buf, rlen + 3) == (uint16_t)(buf[rlen + 3] | (buf[rlen + 4] << 8))
+-		        ? "ok" : "bad");
++	/* response: data[rlen] | ecode | cmd_lo cmd_hi | crc_lo crc_hi */
++	uint16_t crc_recv = (uint16_t)(buf[rlen + 3] | (buf[rlen + 4] << 8));
++	uint16_t crc_calc = crc16(buf, rlen + 3);
++	uint16_t cmd_recv = (uint16_t)(buf[rlen + 1] | (buf[rlen + 2] << 8));
++	if (crc_recv != crc_calc) {
++		unsigned show = rlen + 5 > 20 ? 20 : rlen + 5;
++		printf("SWEET TOUCH: tcs rd c%u cmd%u ec=%x crc %x!=%x:", class, id,
++		    buf[rlen], crc_recv, crc_calc);
+ 		for (unsigned i = 0; i < show; i++) {
+ 			printf(" %02x", buf[i]);
+ 		}
+ 		printf("\n");
+-		return buf[rlen] != 0 ? -1 : -2;
++		return -2;
++	}
++	if (buf[rlen] != 0 && touch_events_printed < 2) {
++		/* vendor does not fail SPI reads on ecode; keep it in the log */
++		printf("SWEET TOUCH: tcs rd c%u cmd%u ecode=%x cmd_echo=%x\n",
++		    class, id, buf[rlen], cmd_recv);
+ 	}
+ 	memcpy(rdata, buf, rlen);
+ 	return 0;
+@@ -511,7 +543,7 @@
+ 		wr(apclk, bus->apclk_off, (c & ~((3u) | (7u << 8))) | 3u);
+ 		delay(1000);
+ 		touch_reset();
+-		spi_init(0, 1);
++		spi_init(0, 1, 9);
+ 		if (spi_bus_alive(bus->apclk_off) == 0) {
+ 			live = bus;
+ 			break;
+@@ -528,17 +560,27 @@
+ 	delay(1000);
+ 
+ 	touch_reset();
+-	spi_init(0, 0);
++	spi_init(0, 0, 9);
+ 	spi_trace_one();
+ 	touch_probe();
+ 	if (!touch_probed_ok) {
+ 		touch_reset();
+-		spi_init(0, 1);
++		spi_init(0, 0, 15);	/* vendor runs 6 MHz */
++		touch_probe();
++	}
++	if (!touch_probed_ok) {
++		touch_reset();
++		spi_init(0, 1, 9);
++		touch_probe();
++	}
++	if (!touch_probed_ok) {
++		touch_reset();
++		spi_init(0, 1, 15);
+ 		touch_probe();
+ 	}
+ 	if (!touch_probed_ok) {
+ 		touch_reset();
+-		spi_init(1, 1);
++		spi_init(1, 1, 9);
+ 		touch_probe();
+ 	}
+ 	if (!touch_probed_ok) {
+@@ -548,7 +590,7 @@
+ 		wr(spi, SPI_CLKD, 0);
+ 		delay(1000);
+ 		touch_reset();
+-		spi_init(0, 1);
++		spi_init(0, 1, 9);
+ 		touch_probe();
+ 	}
+ 	if (!touch_probed_ok) {
