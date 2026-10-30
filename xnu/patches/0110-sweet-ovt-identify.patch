@@ -1,0 +1,143 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 12:15:58.519655885 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 12:42:40.833032611 +0300
+@@ -428,6 +428,92 @@
+ 	return 0;
+ }
+ 
++/* OVT TCM: read len bytes while clocking 0xFF out (mode 3). */
++static int
++ovt_read(uint8_t *buf, unsigned len)
++{
++	unsigned done = 0;
++	while (done < len) {
++		unsigned n = len - done > 32 ? 32 : len - done;
++		if (spi_rx(buf + done, n) != 0) {
++			return -1;
++		}
++		done += n;
++	}
++	return 0;
++}
++
++static void
++ovt_reset(void)
++{
++	/* reset-on-state = 0: assert low 20 ms, release high 200 ms */
++	gpio_dir(gpio, 145, 1);
++	gpio_dat(gpio, 145, 0);
++	delay(20000);
++	gpio_dat(gpio, 145, 1);
++	delay(200000);
++}
++
++static void
++ovt_probe(void)
++{
++	uint8_t hdr[9];
++	uint8_t buf[160];
++
++	ovt_reset();
++	if (ovt_read(hdr, sizeof(hdr)) != 0) {
++		printf("SWEET TOUCH: ovt header read failed\n");
++		return;
++	}
++	printf("SWEET TOUCH: ovt hdr %02x %02x %02x %02x\n",
++	    hdr[0], hdr[1], hdr[2], hdr[3]);
++	if (hdr[0] != 0xa5 || hdr[1] != 0x10) {
++		printf("SWEET TOUCH: ovt not in TCM stream mode\n");
++		return;
++	}
++	unsigned plen = hdr[2] | (hdr[3] << 8);
++	if (plen > 64) {
++		plen = 64;
++	}
++	unsigned rest = 4 + plen + 1 - 9;	/* message minus first 9 bytes */
++	if (rest + 2 > sizeof(buf)) {
++		return;
++	}
++	if (ovt_read(buf, rest + 2) != 0) {
++		printf("SWEET TOUCH: ovt identify body read failed\n");
++		return;
++	}
++	printf("SWEET TOUCH: ovt cont %02x %02x\n", buf[0], buf[1]);
++	uint8_t *id = buf + 2;			/* payload starts after A5 03 */
++	printf("SWEET TOUCH: ovt id ver=%u mode=%x part=%.16s build=%x\n",
++	    id[0], id[1], (char *)(id + 2),
++	    id[18] | (id[19] << 8) | (id[20] << 16) | ((uint32_t)id[21] << 24));
++	if (id[1] != 0x01) {
++		printf("SWEET TOUCH: ovt not in application mode (0x%x)\n", id[1]);
++		return;
++	}
++	/* GET_APPLICATION_INFO 0x20, len 0 */
++	uint8_t cmd[3] = { 0x20, 0x00, 0x00 };
++	if (spi_tx(cmd, 3) != 0 || ovt_read(hdr, 4) != 0) {
++		printf("SWEET TOUCH: ovt app-info request failed\n");
++		return;
++	}
++	unsigned alen = hdr[2] | (hdr[3] << 8);
++	if (hdr[0] != 0xa5 || hdr[1] != 0x01 || alen > 120) {
++		printf("SWEET TOUCH: ovt app-info hdr %02x %02x len %u\n",
++		    hdr[0], hdr[1], alen);
++		return;
++	}
++	if (ovt_read(buf, alen + 1) != 0) {
++		return;
++	}
++	printf("SWEET TOUCH: ovt app status=%u max=%ux%u objects=%u cfg=%u pl=%u\n",
++	    buf[2] | (buf[3] << 8),
++	    buf[32] | (buf[33] << 8), buf[34] | (buf[35] << 8),
++	    buf[36] | (buf[37] << 8), buf[12] | (buf[13] << 8),
++	    buf[14] | (buf[15] << 8));
++}
++
+ static void
+ touch_probe_program_mode(void)
+ {
+@@ -621,43 +707,9 @@
+ 	wr(apclk, 0x58, (c58 & ~((3u) | (7u << 8))) | 3u);
+ 	delay(1000);
+ 
+-	touch_reset();
+-	spi_init(0, 0, 9);
+-	spi_trace_one();
+-	touch_probe();
+-	if (!touch_probed_ok) {
+-		touch_reset();
+-		spi_init(0, 0, 15);	/* vendor runs 6 MHz */
+-		touch_probe();
+-	}
+-	if (!touch_probed_ok) {
+-		touch_reset();
+-		spi_init(0, 1, 9);
+-		touch_probe();
+-	}
+-	if (!touch_probed_ok) {
+-		touch_reset();
+-		spi_init(0, 1, 15);
+-		touch_probe();
+-	}
+-	if (!touch_probed_ok) {
+-		touch_reset();
+-		spi_init(1, 1, 9);
+-		touch_probe();
+-	}
+-	if (!touch_probed_ok) {
+-		/* fallback: source = ext-26m (13 MHz on the wire) */
+-		uint32_t c58 = rd(apclk, 0x58);
+-		wr(apclk, 0x58, c58 & ~3u);
+-		wr(spi, SPI_CLKD, 0);
+-		delay(1000);
+-		touch_reset();
+-		spi_init(0, 1, 9);
+-		touch_probe();
+-	}
+-	if (!touch_probed_ok) {
+-		touch_probe_program_mode();
+-	}
++	/* This panel is Omnivision TCM (TD4160 HX): mode 3, 3 MHz for bring-up */
++	spi_init(1, 1, 31);
++	ovt_probe();
+ 	if (!touch_probed_ok) {
+ 		printf("SWEET TOUCH: probe failed, polling thread not started\n");
+ 		return;
