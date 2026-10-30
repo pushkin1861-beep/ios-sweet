@@ -1,0 +1,116 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 05:04:39.306478289 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 10:08:18.224745322 +0300
+@@ -401,6 +401,46 @@
+ 	}
+ }
+ 
++struct sweet_spi_bus {
++	uint32_t base;
++	uint32_t gate_bit;	/* apapb spi<n>-eb */
++	uint32_t apclk_off;	/* ap-spi<n>-clk mux/div register */
++};
++
++static const struct sweet_spi_bus sweet_spi_buses[] = {
++	{ 0x20150000u, 8, 0x58 },	/* spi3 - vendor touch bus */
++	{ 0x20140000u, 7, 0x54 },	/* spi2 */
++	{ 0x20130000u, 6, 0x50 },	/* spi1 */
++	{ 0x20120000u, 5, 0x4c },	/* spi0 */
++};
++
++static int
++spi_bus_alive(uint32_t off)
++{
++	/* returns 0 when the controller reports a completed transfer */
++	wr(spi, SPI_CTL0, rd(spi, SPI_CTL0) | SPI_CSN_MASK);
++	uint32_t ctl1 = rd(spi, SPI_CTL1);
++	wr(spi, SPI_CTL1, (ctl1 & ~(SPI_TX_MODE | SPI_RX_MODE)) | SPI_TX_MODE);
++	wr(spi, SPI_CTL8, 1);
++	wr(spi, SPI_CTL9, 0);
++	wr(spi, SPI_TXD, 0x00);
++	int ok = -1;
++	for (int i = 0; i < 3; i++) {
++		delay(1000);
++		if (rd(spi, SPI_INT_RAW) & SPI_TX_END) {
++			ok = 0;
++			break;
++		}
++	}
++	uint32_t raw = rd(spi, SPI_INT_RAW), sts2 = rd(spi, SPI_STS2);
++	wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
++	wr(spi, SPI_CTL1, rd(spi, SPI_CTL1) & ~(SPI_TX_MODE | SPI_RX_MODE));
++	wr(spi, SPI_CTL0, rd(spi, SPI_CTL0) & ~SPI_CS0_VALID);
++	printf("SWEET TOUCH: bus%u raw=%x sts2=%x %s\n", off, raw, sts2,
++	    ok == 0 ? "ALIVE" : "dead");
++	return ok;
++}
++
+ void
+ sweet_input_init(void)
+ {
+@@ -409,31 +449,49 @@
+ 	if (mode == 0) {
+ 		return;
+ 	}
+-	spi = ml_io_map(SPI3_BASE, 0x1000);
+ 	gpio = ml_io_map(AP_GPIO_BASE, 0x10000);
+ 	syscon = ml_io_map(APAPB_SYSCON, 0x3000);
+ 	apclk = ml_io_map(AP_CLK_BASE, 0x1000);
+ 	pinctrl = ml_io_map(PINCTRL_BASE, 0x10000);
+ 	pll1 = ml_io_map(PLL1_BASE, 0x1000);
+-	if (!spi || !gpio || !syscon || !apclk || !pinctrl || !pll1) {
++	if (!gpio || !syscon || !apclk || !pinctrl || !pll1) {
+ 		printf("SWEET TOUCH: ml_io_map failed\n");
+ 		return;
+ 	}
+ 
+-	/* clocks: gate spi3-eb only (BIT8). Writing apb-reg-eb/lfin here wedged
+-	 * the early boot: those gates belong to other APB blocks on this SoC. */
+-	wr(syscon, 0x1000, 1u << 8);
+-	/* APAPB reset for SPI3 is RESET_AP_APB_SPI3_SOFT_RST = {0x4, BIT(7)};
+-	 * assert goes to +0x1000 and deassert to +0x2000 like the clocks.
+-	 * Print the three registers, then run one assert/deassert cycle. */
+-	printf("SWEET TOUCH: reset regs %x %x %x\n", rd(syscon, 0x04),
+-	    rd(syscon, 0x1004), rd(syscon, 0x2004));
+-	wr(syscon, 0x1004, 1u << 7);
+-	delay(1000);
+-	wr(syscon, 0x2004, 1u << 7);
+-	delay(1000);
+-	printf("SWEET TOUCH: reset regs after %x %x %x\n", rd(syscon, 0x04),
+-	    rd(syscon, 0x1004), rd(syscon, 0x2004));
++	/* Bring up every AP SPI instance long enough for a one-byte transfer:
++	 * the stock overlay does not resolve which bus the panel variant uses. */
++	spi = ml_io_map(sweet_spi_buses[0].base, 0x1000);
++	if (!spi) {
++		printf("SWEET TOUCH: spi map failed\n");
++		return;
++	}
++	const struct sweet_spi_bus *live = NULL;
++	for (unsigned b = 0; b < sizeof(sweet_spi_buses) / sizeof(sweet_spi_buses[0]); b++) {
++		const struct sweet_spi_bus *bus = &sweet_spi_buses[b];
++		if (b != 0) {
++			spi = ml_io_map(bus->base, 0x1000);
++			if (!spi) {
++				continue;
++			}
++		}
++		wr(syscon, 0x1000, 1u << bus->gate_bit);
++		uint32_t c = rd(apclk, bus->apclk_off);
++		wr(apclk, bus->apclk_off, (c & ~((3u) | (7u << 8))) | 3u);
++		delay(1000);
++		touch_reset();
++		spi_init(0, 1);
++		if (spi_bus_alive(bus->apclk_off) == 0) {
++			live = bus;
++			break;
++		}
++	}
++	if (!live) {
++		printf("SWEET TOUCH: no SPI instance completes a transfer\n");
++		return;
++	}
++	printf("SWEET TOUCH: using spi base %x (apclk %x)\n",
++	    live->base, live->apclk_off);
+ 	uint32_t c58 = rd(apclk, 0x58);
+ 	wr(apclk, 0x58, (c58 & ~((3u) | (7u << 8))) | 3u);
+ 	delay(1000);
