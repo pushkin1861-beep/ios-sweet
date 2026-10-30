@@ -1,0 +1,21 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 04:39:59.047725149 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 05:04:39.306478289 +0300
+@@ -423,6 +423,17 @@
+ 	/* clocks: gate spi3-eb only (BIT8). Writing apb-reg-eb/lfin here wedged
+ 	 * the early boot: those gates belong to other APB blocks on this SoC. */
+ 	wr(syscon, 0x1000, 1u << 8);
++	/* APAPB reset for SPI3 is RESET_AP_APB_SPI3_SOFT_RST = {0x4, BIT(7)};
++	 * assert goes to +0x1000 and deassert to +0x2000 like the clocks.
++	 * Print the three registers, then run one assert/deassert cycle. */
++	printf("SWEET TOUCH: reset regs %x %x %x\n", rd(syscon, 0x04),
++	    rd(syscon, 0x1004), rd(syscon, 0x2004));
++	wr(syscon, 0x1004, 1u << 7);
++	delay(1000);
++	wr(syscon, 0x2004, 1u << 7);
++	delay(1000);
++	printf("SWEET TOUCH: reset regs after %x %x %x\n", rd(syscon, 0x04),
++	    rd(syscon, 0x1004), rd(syscon, 0x2004));
+ 	uint32_t c58 = rd(apclk, 0x58);
+ 	wr(apclk, 0x58, (c58 & ~((3u) | (7u << 8))) | 3u);
+ 	delay(1000);
