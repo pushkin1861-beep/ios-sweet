@@ -1,0 +1,73 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 03:35:33.367082666 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 03:57:30.764118182 +0300
+@@ -57,6 +57,8 @@
+ #define SPI_TX_END	(1u << 8)
+ #define SPI_RX_END	(1u << 9)
+ #define SPI_NG_TX	(1u << 1)
++#define SPI_NG_RX	(1u << 0)
++#define SPI_SCK_REV	(1u << 13)
+ #define SPI_CSN_MASK	(0xfu << 8)
+ #define SPI_CS0_VALID	(1u << 8)
+ #define SPI_TX_MODE	(1u << 13)
+@@ -175,11 +177,14 @@
+ 	return 0;
+ }
+ 
++/* Vendor board DTS puts spi-cpha on the touch node, so try CPHA first;
++ * CPHA selects NG_RX instead of NG_TX in CTL0 (vendor init_hw). */
+ static void
+-spi_init(void)
++spi_init(int cpol, int cpha)
+ {
+-	/* mode 0: CPOL=0, CPHA=0 -> NG_TX (BIT1) per vendor init_hw */
+-	wr(spi, SPI_CTL0, 0x8 | SPI_NG_TX);
++	uint32_t ctl0 = 0x8 | (cpha ? SPI_NG_RX : SPI_NG_TX) |
++	    (cpol ? SPI_SCK_REV : 0);
++	wr(spi, SPI_CTL0, ctl0);
+ 	wr(spi, SPI_CLKD, 9);			/* 192M / ((9+1)*2) = 9.6 MHz */
+ 	wr(spi, SPI_CTL5, 9);			/* vendor minimum interval */
+ 	wr(spi, SPI_FIFO_RST, 1);
+@@ -303,8 +308,8 @@
+ 	printf("SWEET TOUCH: regs ctl0=%x clkd=%x gate=%x apclk58=%x pll0=%x pads=%x,%x,%x inf=%x,%x,%x\n",
+ 	    rd(spi, SPI_CTL0), rd(spi, SPI_CLKD),
+ 	    rd(syscon, 0x0000), rd(apclk, 0x58), rd(pll1, 0x00),
+-	    rd(pinctrl, 0x138), rd(pinctrl, 0x13c), rd(pinctrl, 0x140),
+-	    rd(pinctrl, 0x14), rd(pinctrl, 0x18), rd(pinctrl, 0x1c));
++	    rd(pinctrl, 0x260), rd(pinctrl, 0x264), rd(pinctrl, 0x268),
++	    rd(pinctrl, 0x98), rd(pinctrl, 0x94), rd(pinctrl, 0x90));
+ 	if (err == 0) {
+ 		uint16_t rx = (uint16_t)(xy[0] | (xy[1] << 8));
+ 		uint16_t ry = (uint16_t)(xy[2] | (xy[3] << 8));
+@@ -401,18 +406,26 @@
+ 	delay(1000);
+ 
+ 	touch_reset();
+-	spi_init();
++	spi_init(0, 0);
+ 	touch_probe();
+-
+ 	if (!touch_probed_ok) {
+-		/* fallback: source = ext-26m (13 MHz on the wire), in case the
+-		 * 192M path is not actually reaching the controller */
++		touch_reset();
++		spi_init(0, 1);
++		touch_probe();
++	}
++	if (!touch_probed_ok) {
++		touch_reset();
++		spi_init(1, 1);
++		touch_probe();
++	}
++	if (!touch_probed_ok) {
++		/* fallback: source = ext-26m (13 MHz on the wire) */
+ 		uint32_t c58 = rd(apclk, 0x58);
+ 		wr(apclk, 0x58, c58 & ~3u);
+ 		wr(spi, SPI_CLKD, 0);
+ 		delay(1000);
+ 		touch_reset();
+-		spi_init();
++		spi_init(0, 1);
+ 		touch_probe();
+ 	}
+ 	if (!touch_probed_ok) {
