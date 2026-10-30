@@ -1,0 +1,166 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 13:04:07.842776655 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 13:30:05.986550744 +0300
+@@ -435,7 +435,14 @@
+ 	unsigned done = 0;
+ 	while (done < len) {
+ 		unsigned n = len - done > 32 ? 32 : len - done;
+-		if (spi_rx(buf + done, n) != 0) {
++		int err = spi_rx(buf + done, n);
++		if (err != 0) {
++			/* drain whatever the FIFO did receive so the dump is useful */
++			for (unsigned i = 0; i < n; i++) {
++				buf[done + i] = rdb(spi, SPI_TXD);
++			}
++			printf("SWEET TOUCH: rx fail n=%u raw=%x sts2=%x\n", n,
++			    rd(spi, SPI_INT_RAW), rd(spi, SPI_STS2));
+ 			return -1;
+ 		}
+ 		done += n;
+@@ -454,56 +461,76 @@
+ 	delay(200000);
+ }
+ 
+-static void
+-ovt_probe(void)
++static int
++ovt_identify(uint8_t *id, unsigned *plen_out)
+ {
+ 	uint8_t hdr[9];
+-	uint8_t buf[160];
+-
+ 	ovt_reset();
+ 	if (ovt_read(hdr, sizeof(hdr)) != 0) {
+ 		printf("SWEET TOUCH: ovt header read failed\n");
+-		return;
++		return -1;
+ 	}
+ 	printf("SWEET TOUCH: ovt hdr %02x %02x %02x %02x\n",
+ 	    hdr[0], hdr[1], hdr[2], hdr[3]);
+ 	if (hdr[0] != 0xa5 || hdr[1] != 0x10) {
+-		printf("SWEET TOUCH: ovt not in TCM stream mode\n");
+-		return;
++		return -1;
+ 	}
+ 	unsigned plen = hdr[2] | (hdr[3] << 8);
+-	if (plen > 64) {
+-		plen = 64;
++	if (plen != 24) {
++		return -1;
+ 	}
+-	unsigned rest = 4 + plen + 1 - 9;	/* message minus first 9 bytes */
+-	if (rest + 2 > sizeof(buf)) {
+-		return;
++	memcpy(id, hdr + 4, 5);		/* first 5 payload bytes */
++	*plen_out = plen;
++	return 0;
++}
++
++static void
++ovt_probe(void)
++{
++	uint8_t id[64];
++	unsigned plen = 0;
++	uint8_t buf[128];
++
++	/* A: one continued read of remaining+2 = 22 bytes (vendor shape) */
++	if (ovt_identify(id, &plen) == 0) {
++		delay(100);
++		int ok = ovt_read(buf, 22) == 0 && buf[0] == 0xa5 && buf[1] == 0x03;
++		printf("SWEET TOUCH: ovt A %s %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    ok ? "ok" : "fail", buf[0], buf[1], buf[2], buf[3], buf[4],
++		    buf[5], buf[6], buf[7]);
++		if (ok) {
++			memcpy(id + 5, buf + 2, 19);
++			goto parsed;
++		}
+ 	}
+-	uint8_t *id = buf + 2;			/* payload starts after A5 03 */
+-	int got = -1;
+-	/* A: one continued read of rest+2 (vendor shape) */
+-	delay(100);
+-	if (ovt_read(buf, rest + 2) == 0 && buf[0] == 0xa5 && buf[1] == 0x03) {
+-		got = 0;
+-	}
+-	/* B: two-step: A5 03 header, then the rest */
+-	if (got != 0) {
+-		delay(1000);
++	/* B: A5 03 header (2 bytes) then the 20 remaining bytes */
++	if (ovt_identify(id, &plen) == 0) {
++		delay(500);
+ 		uint8_t h2[2];
+-		if (ovt_read(h2, 2) == 0 && h2[0] == 0xa5) {
+-			if (ovt_read(buf + 2, rest) == 0) {
+-				buf[0] = h2[0];
+-				buf[1] = h2[1];
+-				got = 0;
+-			}
++		int ok = ovt_read(h2, 2) == 0 && h2[0] == 0xa5;
++		printf("SWEET TOUCH: ovt B hdr %s %02x %02x\n",
++		    ok ? "ok" : "fail", h2[0], h2[1]);
++		if (ok && ovt_read(buf, 20) == 0) {
++			memcpy(id + 5, buf, 19);
++			goto parsed;
+ 		}
+ 	}
+-	if (got != 0) {
+-		printf("SWEET TOUCH: ovt body failed raw=%x sts2=%x to=%d\n",
+-		    rd(spi, SPI_INT_RAW), rd(spi, SPI_STS2), spi_timeout_ms);
+-		return;
++	/* C: the device may stream just the 20 remaining bytes on a new CS */
++	if (ovt_identify(id, &plen) == 0) {
++		delay(500);
++		int ok = ovt_read(buf, 20) == 0;
++		printf("SWEET TOUCH: ovt C %s %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    ok ? "ok" : "fail", buf[0], buf[1], buf[2], buf[3], buf[4],
++		    buf[5], buf[6], buf[7]);
++		if (ok) {
++			memcpy(id + 5, buf, 19);
++			goto parsed;
++		}
+ 	}
+-	printf("SWEET TOUCH: ovt cont %02x %02x\n", buf[0], buf[1]);
++	printf("SWEET TOUCH: ovt all body strategies failed to=%d\n", spi_timeout_ms);
++	return;
++
++parsed:
+ 	printf("SWEET TOUCH: ovt id ver=%u mode=%x part=%.16s build=%x\n",
+ 	    id[0], id[1], (char *)(id + 2),
+ 	    id[18] | (id[19] << 8) | (id[20] << 16) | ((uint32_t)id[21] << 24));
+@@ -511,26 +538,26 @@
+ 		printf("SWEET TOUCH: ovt not in application mode (0x%x)\n", id[1]);
+ 		return;
+ 	}
+-	/* GET_APPLICATION_INFO 0x20, len 0 */
+ 	uint8_t cmd[3] = { 0x20, 0x00, 0x00 };
+-	if (spi_tx(cmd, 3) != 0 || ovt_read(hdr, 4) != 0) {
++	if (spi_tx(cmd, 3) != 0 || ovt_read(buf, 4) != 0) {
+ 		printf("SWEET TOUCH: ovt app-info request failed\n");
+ 		return;
+ 	}
+-	unsigned alen = hdr[2] | (hdr[3] << 8);
+-	if (hdr[0] != 0xa5 || hdr[1] != 0x01 || alen > 120) {
++	unsigned alen = buf[2] | (buf[3] << 8);
++	if (buf[0] != 0xa5 || buf[1] != 0x01 || alen > 100) {
+ 		printf("SWEET TOUCH: ovt app-info hdr %02x %02x len %u\n",
+-		    hdr[0], hdr[1], alen);
++		    buf[0], buf[1], alen);
+ 		return;
+ 	}
+-	if (ovt_read(buf, alen + 1) != 0) {
++	if (ovt_read(buf + 4, alen + 1) != 0) {
++		printf("SWEET TOUCH: ovt app-info body failed\n");
+ 		return;
+ 	}
+ 	printf("SWEET TOUCH: ovt app status=%u max=%ux%u objects=%u cfg=%u pl=%u\n",
+-	    buf[2] | (buf[3] << 8),
+-	    buf[32] | (buf[33] << 8), buf[34] | (buf[35] << 8),
+-	    buf[36] | (buf[37] << 8), buf[12] | (buf[13] << 8),
+-	    buf[14] | (buf[15] << 8));
++	    buf[6] | (buf[7] << 8),
++	    buf[36] | (buf[37] << 8), buf[38] | (buf[39] << 8),
++	    buf[40] | (buf[41] << 8), buf[16] | (buf[17] << 8),
++	    buf[18] | (buf[19] << 8));
+ }
+ 
+ static void
