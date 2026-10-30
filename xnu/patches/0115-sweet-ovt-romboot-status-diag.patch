@@ -1,0 +1,44 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 20:35:01.490585068 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 21:11:34.850841994 +0300
+@@ -557,11 +557,15 @@
+ 		spi_cs(1);
+ 		int err = spi_rx_core(buf, 9);
+ 		spi_cs(0);
+-		if (err == 0 && buf[0] == 0xa5) {
+-			if (buf[1] != 0x01 && buf[1] != 0x03) {
++		if (err == 0) {
++			printf("SWEET TOUCH: ovt status raw %02x %02x %02x %02x\n",
++			    buf[0], buf[1], buf[2], buf[3]);
++			if (buf[0] == 0xa5 && (buf[1] == 0x01 || buf[1] == 0x03)) {
++				return 0;
++			}
++			if (buf[0] == 0xa5) {
+ 				return -1;
+ 			}
+-			return 0;
+ 		}
+ 		delay(20000);
+ 	}
+@@ -591,9 +595,18 @@
+ 		printf("SWEET TOUCH: ovt romboot: fw transfer failed\n");
+ 		return;
+ 	}
+-	if (ovt_wait_status(3000) != 0) {
+-		printf("SWEET TOUCH: ovt romboot: no 0x45 status\n");
+-		return;
++	delay(50000);
++	if (ovt_wait_status(5000) != 0) {
++		printf("SWEET TOUCH: ovt romboot: no 0x45 status, retry after reset\n");
++		touch_reset();
++		if (spi_tx_hold(ovt_msg, 3 + dlen) != 0) {
++			return;
++		}
++		delay(50000);
++		if (ovt_wait_status(5000) != 0) {
++			printf("SWEET TOUCH: ovt romboot: 0x45 rejected\n");
++			return;
++		}
+ 	}
+ 	printf("SWEET TOUCH: ovt romboot: fw accepted, run bootloader\n");
+ 	if (spi_tx_hold(run42, sizeof(run42)) != 0) {
