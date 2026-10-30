@@ -20,6 +20,11 @@ on:
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
+  # GitHub-side retry after the macOS-14 brownouts (30 Oct 14:00-31 Oct 00:00
+  # UTC and the following days). The schedule keeps firing every hour until a
+  # build succeeds; downloading the artifact is done later from this PC.
+  schedule:
+    - cron: "7 0-5 * * *"
 
 concurrency:
   # Per commit: re-dispatching the same commit replaces its own queued build,
