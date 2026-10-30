@@ -1,0 +1,81 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 11:24:39.319255345 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-30 12:15:58.519655885 +0300
+@@ -388,6 +388,67 @@
+ 	spi_dir(0);
+ }
+ 
++/* Program/boot-mode frames (vendor cts_platform.c): write 0x60 + BE24 addr
++ * + data, read 0x61 + BE24 addr then rlen+5 bytes (data starts at rx+5). */
++static int
++prog_wr(uint32_t addr, const uint8_t *data, unsigned len)
++{
++	uint8_t tx[4 + 32];
++	if (len > 32) {
++		return -1;
++	}
++	tx[0] = 0x60;
++	tx[1] = (addr >> 16) & 0xff;
++	tx[2] = (addr >> 8) & 0xff;
++	tx[3] = addr & 0xff;
++	memcpy(tx + 4, data, len);
++	return spi_tx(tx, 4 + len);
++}
++
++static int
++prog_rd(uint32_t addr, uint8_t *out, unsigned len)
++{
++	uint8_t tx[4];
++	uint8_t rx[4 + 32 + 5];
++	if (len > 32) {
++		return -1;
++	}
++	tx[0] = 0x61;
++	tx[1] = (addr >> 16) & 0xff;
++	tx[2] = (addr >> 8) & 0xff;
++	tx[3] = addr & 0xff;
++	if (spi_tx(tx, 4) != 0) {
++		return -1;
++	}
++	delay(100);
++	if (spi_rx(rx, len + 5) != 0) {
++		return -1;
++	}
++	memcpy(out, rx + 5, len);
++	return 0;
++}
++
++static void
++touch_probe_program_mode(void)
++{
++	static const uint8_t magic[4] = { 0xcc, 0x33, 0x55, 0x5a };
++	uint8_t mode = 0xff, hwid[4] = { 0xff, 0xff, 0xff, 0xff };
++	int mok, hok;
++
++	touch_reset();
++	if (prog_wr(0x000000, magic, sizeof(magic)) != 0) {
++		printf("SWEET TOUCH: prog magic write failed\n");
++		return;
++	}
++	delay(5000);
++	mok = prog_rd(0x030011, &mode, 1);
++	hok = prog_rd(0x030000, hwid, 4);
++	uint32_t id = hwid[0] | (hwid[1] << 8) | (hwid[2] << 16) |
++	    ((uint32_t)hwid[3] << 24);
++	printf("SWEET TOUCH: prog mode read=%d current_mode=%x (idle1 flash2 sram3) hwid read=%d %x\n",
++	    mok, mode & 7, hok, id & 0xfffffff0u);
++}
++
+ static void
+ touch_probe(void)
+ {
+@@ -595,6 +656,9 @@
+ 		touch_probe();
+ 	}
+ 	if (!touch_probed_ok) {
++		touch_probe_program_mode();
++	}
++	if (!touch_probed_ok) {
+ 		printf("SWEET TOUCH: probe failed, polling thread not started\n");
+ 		return;
+ 	}
