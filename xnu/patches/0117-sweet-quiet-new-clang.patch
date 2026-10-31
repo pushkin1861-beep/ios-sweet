@@ -1,0 +1,18 @@
+diff -ruN a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+--- a/makedefs/MakeInc.def	2026-10-30 20:38:25.000000000 +0300
++++ b/makedefs/MakeInc.def	2026-10-31 10:48:55.429048428 +0300
+@@ -305,7 +305,14 @@
+ # We must not use -fno-keep-inline-functions, or it will remove the dtrace
+ # probes from the kernel.
+ #
++# clang 16+ (Xcode 16/26) adds diagnostics that xnu-8796 was never built with.
++# They are noise, and some builds treat warnings as errors, so silence them.
++COMPAT_QUIET_CFLAGS = -Wno-reserved-identifier -Wno-pre-c11-compat \
++	-Wno-ms-bitfield-padding -Wno-format -Wno-deprecated-non-prototype \
++	-Wno-unused-command-line-argument -Wno-unknown-warning-option
++
+ CFLAGS_GEN = $(DEBUG_CFLAGS) -nostdinc \
++	$(COMPAT_QUIET_CFLAGS) \
+ 	-ferror-limit=10000 \
+ 	-fno-builtin \
+ 	-fno-common \
