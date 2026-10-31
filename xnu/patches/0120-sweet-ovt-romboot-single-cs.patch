@@ -1,0 +1,43 @@
+diff -ruN a/bsd/dev/sweet_input.c b/bsd/dev/sweet_input.c
+--- a/bsd/dev/sweet_input.c	2026-10-30 20:38:27.000000000 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-31 12:39:54.059210706 +0300
+@@ -182,25 +182,25 @@
+ static int
+ spi_tx_hold(const uint8_t *buf, unsigned len)
+ {
+-	int err = 0;
++	/* One TCM message: CS stays low for the whole frame and the full length
++	 * is programmed once. The previous shape reset the FIFO and waited for
++	 * TX_END every 32 bytes, which fragments the frame: the chip sees ~3200
++	 * short transfers and never assembles the download command. */
+ 	spi_cs(1);
+ 	wr(spi, SPI_FIFO_RST, 1);
+ 	wr(spi, SPI_FIFO_RST, 0);
+-	while (len) {
+-		unsigned n = len > 32 ? 32 : len;
+-		spi_dir(SPI_TX_MODE);
+-		spi_lens(n, 0);
+-		for (unsigned i = 0; i < n; i++) {
+-			wrb(spi, SPI_TXD, buf[i]);
++	spi_dir(SPI_TX_MODE);
++	spi_lens(len, 0);
++	for (unsigned i = 0; i < len; i++) {
++		wrb(spi, SPI_TXD, buf[i]);
++		if ((i & 0x1ff) == 0x1ff) {
++			for (int k = 0; k < 200 && (rd(spi, SPI_STS2) & (1u << 8)); k++) {
++				delay(1);
++			}
+ 		}
+-		err = spi_wait_raw(SPI_TX_END);
+-		wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
+-		if (err != 0) {
+-			break;
+-		}
+-		buf += n;
+-		len -= n;
+ 	}
++	int err = spi_wait_raw(SPI_TX_END);
++	wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
+ 	spi_cs(0);
+ 	spi_dir(0);
+ 	return err;
