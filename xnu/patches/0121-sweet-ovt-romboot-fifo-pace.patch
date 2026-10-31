@@ -1,0 +1,18 @@
+--- a/bsd/dev/sweet_input.c	2026-10-31 12:39:54.059210706 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-31 13:05:13.948129498 +0300
+@@ -193,10 +193,13 @@
+ 	spi_lens(len, 0);
+ 	for (unsigned i = 0; i < len; i++) {
+ 		wrb(spi, SPI_TXD, buf[i]);
+-		if ((i & 0x1ff) == 0x1ff) {
+-			for (int k = 0; k < 200 && (rd(spi, SPI_STS2) & (1u << 8)); k++) {
++		/* drain the 32-byte FIFO regularly: a 100 KiB burst without
++		 * yielding starves the SPI clock engine and wedges the boot */
++		if ((i & 0x3ff) == 0x3ff) {
++			for (int k = 0; k < 1000 && (rd(spi, SPI_STS2) & (1u << 8)); k++) {
+ 				delay(1);
+ 			}
++			delay(1);
+ 		}
+ 	}
+ 	int err = spi_wait_raw(SPI_TX_END);

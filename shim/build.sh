@@ -4,7 +4,15 @@ set -euo pipefail
 cd "$(dirname "$0")"
 CC=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
+board_flags=
+img_args="--header_version 2 --dtb ${DTB:-../dtb/boot_unpacked/dtb} --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 --tags_offset 0x100 --dtb_offset 0x1f00000"
+payload_len=0
+if [ "${BOARD:-sweet}" = ums9230 ]; then
+	board_flags=-DBOARD_UMS9230
+	img_args="--header_version 4"
+	[ -n "${1:-}" ] && payload_len=$(stat -c %s "$1")
+fi
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra $board_flags -DPAYLOAD_LEN=$payload_len"
 mkdir -p out
 for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
@@ -17,8 +25,17 @@ $CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -W
 	out/start.o out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o -o out/shim.elf
 $OBJCOPY -O binary out/shim.elf out/Image
 # ABL copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
-size=$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print strtonum("0x"$1)}')
+size=$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print $1}' | python3 -c 'import sys;print(int(sys.stdin.read().strip(),16))')
 truncate -s "$size" out/Image
+if [ "$payload_len" != 0 ]; then
+	cat "$1" >> out/Image
+	python3 - out/Image <<'PYEOF'
+import os, struct, sys
+p=sys.argv[1]
+with open(p,'r+b') as f:
+    f.seek(24); f.write(struct.pack('<Q', os.path.getsize(p)))
+PYEOF
+fi
 # Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
 # newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
 if [ -n "${1:-}" ]; then
@@ -26,9 +43,7 @@ if [ -n "${1:-}" ]; then
 else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
-mkbootimg --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
-	--dtb ../dtb/boot_unpacked/dtb --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
-	--tags_offset 0x100 --dtb_offset 0x1f00000 --pagesize 4096 \
+mkbootimg --kernel out/Image --ramdisk out/ramdisk.bin $img_args \
 	--os_version 17.0.0 --os_patch_level 2035-06 \
 	--cmdline "console=null" -o out/shim-boot.img
 # Host render of the console layout.
