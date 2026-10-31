@@ -60,6 +60,14 @@ workflows:
           # patch 0116 ships Xcode 15.0.1 generated DriverKit files instead.
           export IIG_OFFLINE=1
           echo "IIG_OFFLINE=1" >> $CM_ENV
+      - name: Dump sweet_input state
+        script: |
+          echo "===== sweet_input.c around spi_tx_hold ====="
+          sed -n '170,215p' dxb/xnu/bsd/dev/sweet_input.c || true
+          echo "===== around ovt_romboot send ====="
+          sed -n '575,605p' dxb/xnu/bsd/dev/sweet_input.c || true
+          echo "===== marker greps ====="
+          grep -n "spi_lens(len, 0)\|0x1ff\|0x3ff\|SWEET_OVT_CHUNK\|spi_tx_hold(ovt_msg" dxb/xnu/bsd/dev/sweet_input.c || true
       - name: Build kernel
         script: |
           export MAKEFLAGS=-k
@@ -68,6 +76,14 @@ workflows:
           export OTHER_CFLAGS="-Wno-reserved-identifier"
           export EXTRA_CFLAGS="-Wno-reserved-identifier"
           cd dxb && bash build.sh
+      - name: Verify fetched patches
+        script: |
+          ls xnu/patches/*.patch | wc -l
+          for f in xnu/patches/01*.patch; do
+            b=$(basename "$f")
+            grep -q "Applying patch.*$b" dxb/build.log 2>/dev/null || true
+          done
+          grep -o "0122-sweet-ovt-romboot-stream.patch" dxb/build.log 2>/dev/null | head -1 || true
       - name: Collect kernel
         script: |
           mkdir -p out
