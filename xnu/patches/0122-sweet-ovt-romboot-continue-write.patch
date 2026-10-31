@@ -1,0 +1,68 @@
+--- a/bsd/dev/sweet_input.c	2026-10-31 12:39:54.059210706 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-31 13:19:20.557229359 +0300
+@@ -568,7 +568,8 @@
+ 	return -1;
+ }
+ 
+-static uint8_t ovt_msg[3 + 14 + 102400];
++#define SWEET_OVT_CHUNK 4096
++static uint8_t ovt_msg[3 + 14 + SWEET_OVT_CHUNK];
+ 
+ static void
+ ovt_romboot(void)
+@@ -577,20 +578,44 @@
+ 	static const uint8_t ident02[3] = { 0x02, 0x00, 0x00 };
+ 	uint8_t id[32];
+ 
+-	/* CMD_ROMBOOT_DOWNLOAD 0x45: 14 reserved bytes (size>>16 first) + app */
++	/* CMD_ROMBOOT_DOWNLOAD 0x45: 14 reserved bytes (size>>16 first) + app.
++	 * The AP controller only buffers 32 bytes of FIFO, so the 102 KiB image
++	 * is streamed as 0x45 followed by CMD_CONTINUE_WRITE (0x01) chunks. */
+ 	unsigned dlen = 14 + sizeof(sweet_ovt_app_code);
+-	memset(ovt_msg, 0, 3 + dlen);
+-	ovt_msg[0] = 0x45;
+-	ovt_msg[1] = dlen & 0xff;
+-	ovt_msg[2] = dlen >> 8;
+-	ovt_msg[3] = (sizeof(sweet_ovt_app_code) >> 16) & 0xff;
+-	memcpy(ovt_msg + 3 + 14, sweet_ovt_app_code, sizeof(sweet_ovt_app_code));
+-	printf("SWEET TOUCH: ovt romboot: sending %u B app code\n",
++	printf("SWEET TOUCH: ovt romboot: sending %u B app code in chunks\n",
+ 	    (unsigned)sizeof(sweet_ovt_app_code));
+-	if (spi_tx_hold(ovt_msg, 3 + dlen) != 0) {
+-		printf("SWEET TOUCH: ovt romboot: fw transfer failed\n");
+-		return;
++	unsigned sent = 0;
++	unsigned part = 0;
++	while (sent < dlen) {
++		unsigned n = dlen - sent;
++		if (n > SWEET_OVT_CHUNK) {
++			n = SWEET_OVT_CHUNK;
++		}
++		uint8_t *m = ovt_msg;
++		unsigned mlen;
++		if (sent == 0) {
++			m[0] = 0x45;
++			m[1] = n & 0xff;
++			m[2] = n >> 8;
++			m[3] = (sizeof(sweet_ovt_app_code) >> 16) & 0xff;
++			memset(m + 4, 0, 13);
++			memcpy(m + 3 + 14, sweet_ovt_app_code, n - 14);
++			mlen = 3 + n;
++		} else {
++			m[0] = 0x01;	/* CMD_CONTINUE_WRITE: raw payload */
++			memcpy(m + 1, sweet_ovt_app_code + (sent - 14), n);
++			mlen = 1 + n;
++		}
++		if (spi_tx_hold(m, mlen) != 0) {
++			printf("SWEET TOUCH: ovt romboot: chunk %u failed at %u\n",
++			    part, sent);
++			return;
++		}
++		sent += n;
++		part++;
++		delay(1000);
+ 	}
++	printf("SWEET TOUCH: ovt romboot: %u chunks sent\n", part);
+ 	if (ovt_wait_status(3000) != 0) {
+ 		printf("SWEET TOUCH: ovt romboot: no 0x45 status\n");
+ 		return;
