@@ -1,0 +1,13 @@
+diff -ruN a/iokit/DriverKit/Makefile b/iokit/DriverKit/Makefile
+--- a/iokit/DriverKit/Makefile	2026-10-31 09:46:14.924900205 +0300
++++ b/iokit/DriverKit/Makefile	2026-10-31 11:56:36.488464752 +0300
+@@ -63,7 +63,8 @@
+ 	%.h : gen/%.h
+ 	@$(LOG_IIG) "$@"
+ 	$(_v)$(CP) $< $@
+-$(GENERATED_IMPL) : gen/%.iig.cpp
++$(GENERATED_IMPL) : \
++	%.iig.cpp : gen/%.iig.cpp
+ 	$(_v)$(CP) $< $@
+ else
+ $(GENERATED_HEADERS) : \
