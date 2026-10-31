@@ -63,6 +63,10 @@ workflows:
       - name: Build kernel
         script: |
           export MAKEFLAGS=-k
+          # Newer clang adds -Wreserved-identifier noise for Apple-internal names
+          # (and xnu builds with -Werror in places): silence it for Xcode 16+.
+          export OTHER_CFLAGS="-Wno-reserved-identifier"
+          export EXTRA_CFLAGS="-Wno-reserved-identifier"
           cd dxb && bash build.sh
       - name: Collect kernel
         script: |
