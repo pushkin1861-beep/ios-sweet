@@ -1,6 +1,6 @@
---- a/bsd/dev/sweet_input.c	2026-10-31 12:39:54.059210706 +0300
-+++ b/bsd/dev/sweet_input.c	2026-10-31 13:19:20.557229359 +0300
-@@ -568,7 +568,8 @@
+--- a/bsd/dev/sweet_input.c	2026-10-31 19:34:23.208434756 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-31 19:34:51.006241704 +0300
+@@ -571,7 +571,8 @@
  	return -1;
  }
  
@@ -10,14 +10,15 @@
  
  static void
  ovt_romboot(void)
-@@ -577,20 +578,44 @@
+@@ -580,20 +581,45 @@
  	static const uint8_t ident02[3] = { 0x02, 0x00, 0x00 };
  	uint8_t id[32];
  
 -	/* CMD_ROMBOOT_DOWNLOAD 0x45: 14 reserved bytes (size>>16 first) + app */
 +	/* CMD_ROMBOOT_DOWNLOAD 0x45: 14 reserved bytes (size>>16 first) + app.
-+	 * The AP controller only buffers 32 bytes of FIFO, so the 102 KiB image
-+	 * is streamed as 0x45 followed by CMD_CONTINUE_WRITE (0x01) chunks. */
++	 * This AP controller buffers only 32 bytes of FIFO, so the 102 KiB image
++	 * is streamed as 0x45 followed by CMD_CONTINUE_WRITE (0x01) chunks: one
++	 * giant frame wedges the machine before the UI is up. */
  	unsigned dlen = 14 + sizeof(sweet_ovt_app_code);
 -	memset(ovt_msg, 0, 3 + dlen);
 -	ovt_msg[0] = 0x45;
