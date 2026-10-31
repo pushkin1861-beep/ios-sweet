@@ -1,46 +1,20 @@
---- a/bsd/dev/sweet_input.c	2026-10-30 20:38:27.000000000 +0300
-+++ b/bsd/dev/sweet_input.c	2026-10-31 20:37:12.987358467 +0300
-@@ -182,25 +182,25 @@
- static int
- spi_tx_hold(const uint8_t *buf, unsigned len)
- {
--	int err = 0;
-+	/* One TCM frame: CS stays low and the whole length is programmed once.
-+	 * Resetting the FIFO per 32-byte slice broke long messages; the FIFO is
-+	 * drained in place instead. */
- 	spi_cs(1);
- 	wr(spi, SPI_FIFO_RST, 1);
- 	wr(spi, SPI_FIFO_RST, 0);
--	while (len) {
--		unsigned n = len > 32 ? 32 : len;
--		spi_dir(SPI_TX_MODE);
--		spi_lens(n, 0);
--		for (unsigned i = 0; i < n; i++) {
--			wrb(spi, SPI_TXD, buf[i]);
--		}
--		err = spi_wait_raw(SPI_TX_END);
--		wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
--		if (err != 0) {
--			break;
-+	spi_dir(SPI_TX_MODE);
-+	spi_lens(len, 0);
-+	for (unsigned i = 0; i < len; i++) {
-+		wrb(spi, SPI_TXD, buf[i]);
+--- a/bsd/dev/sweet_input.c	2026-10-31 20:55:47.963860047 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-31 20:56:20.821245662 +0300
+@@ -193,10 +193,11 @@
+ 	spi_lens(len, 0);
+ 	for (unsigned i = 0; i < len; i++) {
+ 		wrb(spi, SPI_TXD, buf[i]);
+-		if ((i & 0x1ff) == 0x1ff) {
+-			for (int k = 0; k < 200 && (rd(spi, SPI_STS2) & (1u << 8)); k++) {
 +		if ((i & 0x3ff) == 0x3ff) {
 +			for (int k = 0; k < 1000 && (rd(spi, SPI_STS2) & (1u << 8)); k++) {
-+				delay(1);
-+			}
+ 				delay(1);
+ 			}
 +			delay(1);
  		}
--		buf += n;
--		len -= n;
  	}
-+	int err = spi_wait_raw(SPI_TX_END);
-+	wr(spi, SPI_INT_CLR, SPI_TX_END | SPI_RX_END);
- 	spi_cs(0);
- 	spi_dir(0);
- 	return err;
-@@ -587,9 +587,24 @@
+ 	int err = spi_wait_raw(SPI_TX_END);
+@@ -587,9 +588,24 @@
  	memcpy(ovt_msg + 3 + 14, sweet_ovt_app_code, sizeof(sweet_ovt_app_code));
  	printf("SWEET TOUCH: ovt romboot: sending %u B app code\n",
  	    (unsigned)sizeof(sweet_ovt_app_code));
