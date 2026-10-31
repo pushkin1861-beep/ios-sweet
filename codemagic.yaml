@@ -56,7 +56,10 @@ workflows:
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> $CM_ENV
           sudo xcode-select -s "$XC"
           xcodebuild -version
-          xcrun --find iig
+          # Xcode 16+ iig emits IORPC.kernelContent which xnu-8796 lacks:
+          # patch 0116 ships Xcode 15.0.1 generated DriverKit files instead.
+          export IIG_OFFLINE=1
+          echo "IIG_OFFLINE=1" >> $CM_ENV
       - name: Build kernel
         script: |
           export MAKEFLAGS=-k
