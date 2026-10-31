@@ -1,5 +1,5 @@
 --- a/bsd/dev/sweet_input.c	2026-10-31 12:27:52.963661714 +0300
-+++ b/bsd/dev/sweet_input.c	2026-10-31 20:11:32.065786256 +0300
++++ b/bsd/dev/sweet_input.c	2026-10-31 20:23:40.961603136 +0300
 @@ -192,10 +192,12 @@
  	spi_lens(len, 0);
  	for (unsigned i = 0; i < len; i++) {
